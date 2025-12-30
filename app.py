@@ -185,13 +185,83 @@ def get_multi_tf_data(ticker_symbol):
         data_map['12M'] = FVG_Engine.resample_data(df_1mo, '12ME') 
     return data_map
 
-def get_social_buzz(query_term):
+def get_social_sentiment_data(ticker, company_name=""):
+    """Fetches news and social mentions for sentiment analysis."""
+    all_data = []
+    
+    # Search queries to try
+    search_queries = [
+        f"{ticker} stock news",
+        f"{ticker} stock reddit",
+        f"{ticker} stock sentiment",
+        f"{company_name} stock analysis" if company_name else f"{ticker} investor sentiment"
+    ]
+    
     try:
+        time.sleep(0.5)  # Rate limit protection
         with DDGS() as ddgs:
-            news = list(ddgs.news(query_term, timelimit="w", max_results=3))
-            return "\n".join([f"News: {n['title']}" for n in news])
-    except:
-        return "Social buzz unavailable (Rate Limit)."
+            # Get recent news
+            try:
+                news = list(ddgs.news(f"{ticker} stock", timelimit="w", max_results=5))
+                for n in news:
+                    all_data.append({
+                        "type": "News",
+                        "title": n.get('title', ''),
+                        "source": n.get('source', 'Unknown'),
+                        "date": n.get('date', ''),
+                        "body": n.get('body', '')[:200] if n.get('body') else ''
+                    })
+            except:
+                pass
+            
+            # Get Reddit/forum discussions
+            try:
+                time.sleep(0.3)
+                reddit_results = list(ddgs.text(f"{ticker} stock reddit discussion", max_results=3))
+                for r in reddit_results:
+                    if 'reddit' in r.get('href', '').lower():
+                        all_data.append({
+                            "type": "Reddit",
+                            "title": r.get('title', ''),
+                            "source": "Reddit",
+                            "body": r.get('body', '')[:200] if r.get('body') else ''
+                        })
+            except:
+                pass
+            
+            # Get Twitter/X mentions
+            try:
+                time.sleep(0.3)
+                twitter_results = list(ddgs.text(f"{ticker} stock twitter OR x.com", max_results=3))
+                for t in twitter_results:
+                    if 'twitter' in t.get('href', '').lower() or 'x.com' in t.get('href', '').lower():
+                        all_data.append({
+                            "type": "Twitter/X",
+                            "title": t.get('title', ''),
+                            "source": "Twitter/X",
+                            "body": t.get('body', '')[:200] if t.get('body') else ''
+                        })
+            except:
+                pass
+                
+            # Get general sentiment articles
+            try:
+                time.sleep(0.3)
+                general = list(ddgs.text(f"{ticker} stock buy sell hold analyst", max_results=3))
+                for g in general:
+                    all_data.append({
+                        "type": "Analysis",
+                        "title": g.get('title', ''),
+                        "source": g.get('href', '').split('/')[2] if g.get('href') else 'Unknown',
+                        "body": g.get('body', '')[:200] if g.get('body') else ''
+                    })
+            except:
+                pass
+                
+    except Exception as e:
+        pass
+    
+    return all_data
 
 # --- REDESIGNED WORKFLOW ---
 
@@ -302,8 +372,50 @@ if ticker_to_analyze:
             Verdict: Bullish/Bearish/Neutral?
             """
             
-            soc_buzz = get_social_buzz(f"{ticker_to_analyze} stock")
-            soc_prompt = f"Sentiment Analysis based on: {soc_buzz}"
+            # Fetch social/news data
+            company_name = info.get('shortName', '') or info.get('longName', '')
+            social_data = get_social_sentiment_data(ticker_to_analyze, company_name)
+            
+            # Build comprehensive social prompt
+            if social_data:
+                social_context = "\n".join([
+                    f"[{item['type']}] {item['title']} - {item.get('body', '')}" 
+                    for item in social_data[:10]
+                ])
+            else:
+                social_context = "Limited social data available"
+            
+            soc_prompt = f"""
+            You are a Senior Market Sentiment Analyst. Analyze the social sentiment for {ticker_to_analyze} ({company_name}).
+            
+            Current Price: ${current_price:.2f}
+            P/E Ratio: {info.get('trailingPE', 'N/A')}
+            
+            RECENT NEWS & SOCIAL DATA:
+            {social_context}
+            
+            Provide a comprehensive sentiment analysis in this EXACT format:
+            
+            ## 📊 Overall Sentiment Score
+            [Give a score from 1-10 and a one-word verdict: Very Bearish / Bearish / Neutral / Bullish / Very Bullish]
+            
+            ## 🔥 Key Sentiment Drivers
+            [List 3-4 main factors driving current sentiment - positive and negative]
+            
+            ## 📰 News Sentiment Summary  
+            [Summarize what the news is saying - bullish or bearish catalysts]
+            
+            ## 💬 Social Media Pulse (Reddit/X)
+            [Summarize retail investor sentiment - what are retail traders saying/feeling]
+            
+            ## ⚠️ Sentiment Risks
+            [Any contrarian signals or risks to watch]
+            
+            ## 🎯 Sentiment-Based Outlook
+            [1-2 sentence actionable insight based on sentiment]
+            
+            Be specific, data-driven, and avoid generic statements. If data is limited, clearly state that and provide what analysis you can.
+            """
             
             fund_an = get_gemini_response(fund_prompt)
             tech_an = get_gemini_response(tech_prompt)
@@ -337,4 +449,16 @@ if ticker_to_analyze:
                 fig.update_layout(template="plotly_dark", height=400, xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
                 st.markdown(tech_an)
-            with t4: st.markdown(soc_an)
+            with t4: 
+                st.markdown(soc_an)
+                
+                # Show source data in an expander
+                if social_data:
+                    st.markdown("---")
+                    with st.expander("📚 View Raw Data Sources", expanded=False):
+                        for item in social_data:
+                            source_icon = "📰" if item['type'] == "News" else "🤖" if item['type'] == "Reddit" else "🐦" if item['type'] == "Twitter/X" else "📊"
+                            st.markdown(f"**{source_icon} [{item['type']}]** {item['title']}")
+                            if item.get('source'):
+                                st.caption(f"Source: {item['source']}")
+                            st.markdown("---")
