@@ -94,6 +94,12 @@ st.title("♟️ Company Analyzer")
 st.markdown(f"*Strategic Deep Dive | Region: {selected_country}*")
 st.markdown("---")
 
+# --- SESSION STATE INITIALIZATION ---
+if 'search_results' not in st.session_state:
+    st.session_state.search_results = []
+if 'selected_ticker' not in st.session_state:
+    st.session_state.selected_ticker = None
+
 # --- FVG ENGINE (Strategic Sniper Logic) ---
 class FVG_Engine:
     @staticmethod
@@ -159,40 +165,45 @@ class FVG_Engine:
 
 # --- HELPER FUNCTIONS ---
 
-def find_ticker_from_name(company_name, country):
-    """Searches DuckDuckGo for the Yahoo Finance ticker."""
-    query = f"{company_name} {country} stock ticker site:finance.yahoo.com"
+def search_tickers(query, country):
+    """
+    Searches DuckDuckGo for Yahoo Finance URLs and extracts tickers.
+    Returns a list of candidate dictionaries.
+    """
+    candidates = []
+    # Broad search query to get Yahoo Finance quote pages
+    search_term = f"site:finance.yahoo.com/quote {query} {country} stock"
+    
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=1))
-            if results:
-                title = results[0]['title']
-                # Regex to find Ticker in parentheses e.g. "Reliance Industries (RELIANCE.NS)"
-                match = re.search(r'\((?P<ticker>[A-Z0-9.-]+)\)', title)
+            # Get more results to ensure we catch the right one
+            results = list(ddgs.text(search_term, max_results=5))
+            
+            for r in results:
+                url = r['href']
+                title = r['title']
+                
+                # Extract Ticker from URL: finance.yahoo.com/quote/TICKER?p=...
+                # Regex looks for the segment after /quote/ and before / or ?
+                match = re.search(r'finance\.yahoo\.com/quote/([A-Z0-9.-]+)', url)
+                
                 if match:
-                    return match.group('ticker')
+                    ticker = match.group(1)
+                    # Avoid duplicates
+                    if not any(d['symbol'] == ticker for d in candidates):
+                        candidates.append({'symbol': ticker, 'title': title})
+                        
     except Exception as e:
-        return None
-    return None
+        return []
+    
+    return candidates
 
 def get_gemini_response(prompt, api_key):
-    """
-    Robust AI Call function mimicking the logic from the working CFA drill code.
-    """
+    """Robust AI Call function."""
     try:
-        # 1. Configure
         genai.configure(api_key=api_key)
-        
-        # 2. Config similar to reference code
         generation_config = genai.types.GenerationConfig(temperature=0.7)
-        
-        # 3. Model Initialization
-        # We use 'gemini-1.5-flash' as it is the stable flash model. 
-        # If your reference code used '2.5', it might be a typo for '1.5' or a specific beta.
-        # 'gemini-1.5-flash' is generally the safest string for this model class.
         model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
-        
-        # 4. Generate
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -202,10 +213,13 @@ def fetch_financial_data(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
     try:
         info = stock.info
-        if 'symbol' not in info:
-            return None, None, None, None, None, None
+        # Basic check if ticker is valid
+        if 'symbol' not in info and 'longName' not in info:
+             # Fallback: sometimes info is empty but history works.
+             # We rely on history check later.
+             pass
     except:
-        return None, None, None, None, None, None
+        info = {}
 
     try:
         balance_sheet = stock.balance_sheet
@@ -215,18 +229,18 @@ def fetch_financial_data(ticker_symbol):
         balance_sheet, income_stmt, cash_flow = None, None, None
     
     # Get 1 year daily history for chart
-    history_daily = stock.history(period="1y", interval="1d")
+    try:
+        history_daily = stock.history(period="1y", interval="1d")
+    except:
+        history_daily = pd.DataFrame()
+        
     return stock, info, balance_sheet, income_stmt, cash_flow, history_daily
 
 def get_multi_tf_data(ticker_symbol):
-    """
-    Fetches granular data and resamples to create custom timeframes 
-    (4H, 6M, 12M) required for FVG analysis.
-    """
     stock = yf.Ticker(ticker_symbol)
     
     # Fetch base datasets
-    df_1h = stock.history(period="730d", interval="1h") # Max allowed for hourly
+    df_1h = stock.history(period="730d", interval="1h") 
     df_1d = stock.history(period="5y", interval="1d")   
     df_1mo = stock.history(period="max", interval="1mo") 
 
@@ -255,78 +269,88 @@ def get_social_buzz(query_term):
     results = []
     try:
         with DDGS() as ddgs:
-            # News
             news_gen = ddgs.news(query_term, timelimit="w", max_results=3)
             for r in news_gen: results.append(f"Title: {r['title']} | Source: {r['source']}")
-            # Discussions
             text_gen = ddgs.text(f"{query_term} stock sentiment site:reddit.com OR site:x.com", timelimit="w", max_results=3)
             for r in text_gen: results.append(f"Snippet: {r['body']}")
     except Exception as e:
         results.append(f"Could not fetch live social data: {e}")
     return "\n".join(results)
 
-# --- SEARCH & INPUT LOGIC ---
+# --- SEARCH & SELECTION WORKFLOW ---
 
-if 'found_ticker' not in st.session_state:
-    st.session_state.found_ticker = ""
+st.markdown("### 1️⃣ Find Company")
+c1, c2 = st.columns([3, 1])
+with c1:
+    search_input = st.text_input("Enter Company Name or Ticker", placeholder="e.g. Microsoft, Reliance, MSFT...", key="search_input")
+with c2:
+    if st.button("🔎 Search Symbol", use_container_width=True):
+        if search_input:
+            with st.spinner(f"Scanning for '{search_input}' in {selected_country}..."):
+                results = search_tickers(search_input, selected_country)
+                st.session_state.search_results = results
+                # Reset previous analysis if new search
+                st.session_state.selected_ticker = None 
+        else:
+            st.warning("Please enter a name to search.")
 
-col_search_1, col_search_2 = st.columns([3, 1])
+# Display Results if Available
+ticker_to_analyze = None
 
-with col_search_1:
-    user_query = st.text_input("Company Name / Ticker", placeholder="e.g. Reliance, Apple, Shopify...", value=st.session_state.found_ticker)
+if st.session_state.search_results:
+    st.markdown("### 2️⃣ Select Correct Stock")
+    
+    # Create a friendly list of strings "Symbol - Title"
+    options = [f"{item['symbol']} | {item['title']}" for item in st.session_state.search_results]
+    
+    selected_option = st.selectbox("Choose the correct match:", options)
+    
+    # Extract the symbol back from the selection string
+    if selected_option:
+        ticker_to_analyze = selected_option.split(" | ")[0]
+        st.info(f"Selected: **{ticker_to_analyze}**")
 
-with col_search_2:
-    search_btn = st.button("🔍 Find & Analyze", use_container_width=True)
+# --- EXECUTION BUTTON ---
 
-# --- EXECUTION LOGIC ---
+run_analysis = False
+if ticker_to_analyze:
+    st.markdown("### 3️⃣ Execute Analysis")
+    if st.button("🚀 Run Deep Dive Analysis", use_container_width=True):
+        run_analysis = True
 
-if search_btn and user_query:
+# --- ANALYSIS ENGINE ---
+
+if run_analysis and ticker_to_analyze:
     if not api_key:
         st.error("⚠️ API Key Missing. Please set it in sidebar or secrets.toml.")
         st.stop()
-
-    # 1. RESOLVE TICKER
-    ticker_to_use = user_query.strip().upper()
     
-    # Heuristic: If spaced or lowercase or long, assume name and search
-    if " " in user_query or user_query.islower() or len(user_query) > 5:
-        with st.spinner(f"🔍 Searching ticker for '{user_query}' in {selected_country}..."):
-            found = find_ticker_from_name(user_query, selected_country)
-            if found:
-                ticker_to_use = found
-                st.session_state.found_ticker = found
-                st.success(f"Target Identified: {ticker_to_use}")
-            else:
-                st.error(f"Could not find a clear ticker for '{user_query}' in {selected_country}. Please try the exact symbol.")
-                st.stop()
-    
-    # 2. ANALYZE
-    with st.spinner(f"Acquiring Data: {ticker_to_use}..."):
-        stock, info, bs, inc, cf, history = fetch_financial_data(ticker_to_use)
+    with st.spinner(f"Acquiring Intelligence on {ticker_to_analyze}..."):
         
-        if stock is None or history.empty:
-            st.error(f"Could not retrieve financial data for symbol: {ticker_to_use}. It might be delisted or region mismatch.")
+        # 1. Fetch Fundamentals
+        stock, info, bs, inc, cf, history = fetch_financial_data(ticker_to_analyze)
+        
+        if history.empty:
+            st.error(f"Could not retrieve historical data for **{ticker_to_analyze}**. It may be delisted or inactive.")
             st.stop()
             
         current_price = history['Close'].iloc[-1]
         
-        # --- FVG SCANNING ---
-        tf_data = get_multi_tf_data(ticker_to_use)
+        # 2. FVG Scan
+        tf_data = get_multi_tf_data(ticker_to_analyze)
         
-        # Specific Pairs & Percentages from your Requirement Image
-        # Format: (Pair Name, TF1, TF2, Prox1, Prox2)
+        # Pairs & Tolerances
         scan_pairs = [
-            ("1H & 4H", "1H", "4H", 0.01, 0.01),       # 1%
-            ("1D & 1W", "1D", "1W", 0.02, 0.02),       # 2%
-            ("1W & 1M", "1W", "1M", 0.02, 0.03),       # 2% & 3%
-            ("1M & 3M", "1M", "3M", 0.03, 0.04),       # 3% & 4%
-            ("3M & 6M", "3M", "6M", 0.04, 0.05),       # 4% & 5%
-            ("6M & 12M", "6M", "12M", 0.05, 0.05),     # 5%
+            ("1H & 4H", "1H", "4H", 0.01, 0.01),
+            ("1D & 1W", "1D", "1W", 0.02, 0.02),
+            ("1W & 1M", "1W", "1M", 0.02, 0.03),
+            ("1M & 3M", "1M", "3M", 0.03, 0.04),
+            ("3M & 6M", "3M", "6M", 0.04, 0.05),
+            ("6M & 12M", "6M", "12M", 0.05, 0.05),
         ]
         
         fvg_results = []
         for pair_name, tf1_name, tf2_name, prox1, prox2 in scan_pairs:
-            # Check if we have data for both timeframes
             if tf1_name in tf_data and tf2_name in tf_data and tf_data[tf1_name] is not None and tf_data[tf2_name] is not None:
                 fvgs_1 = FVG_Engine.find_bullish_fvgs(tf_data[tf1_name])
                 fvgs_2 = FVG_Engine.find_bullish_fvgs(tf_data[tf2_name])
@@ -342,9 +366,9 @@ if search_btn and user_query:
                         "zones": (valid_1, valid_2)
                     })
         
-        # --- PREPARE PROMPTS ---
+        # 3. Prepare Prompts
         fund_prompt = f"""
-        You are an elite financial analyst. Analyze {ticker_to_use} (Price: {current_price}) based on these metrics:
+        You are an elite financial analyst. Analyze {ticker_to_analyze} (Price: {current_price}) based on these metrics:
         - Market Cap: {info.get('marketCap', 'N/A')}
         - P/E: {info.get('trailingPE', 'N/A')}, Forward P/E: {info.get('forwardPE', 'N/A')}
         - P/B: {info.get('priceToBook', 'N/A')}
@@ -364,7 +388,7 @@ if search_btn and user_query:
         """
         
         tech_prompt = f"""
-        You are a Chartered Market Technician (CMT). Analyze the technical structure of {ticker_to_use}.
+        You are a Chartered Market Technician (CMT). Analyze the technical structure of {ticker_to_analyze}.
         Current Price: {current_price}
         
         Recent OHLCV Data (Daily):
@@ -380,9 +404,9 @@ if search_btn and user_query:
         Provide a "Sniper's Verdict": Bullish, Bearish, or Neutral/Wait.
         """
         
-        social_raw = get_social_buzz(f"{ticker_to_use} stock")
+        social_raw = get_social_buzz(f"{ticker_to_analyze} stock")
         social_prompt = f"""
-        Analyze the sentiment for {ticker_to_use} based on these recent search snippets:
+        Analyze the sentiment for {ticker_to_analyze} based on these recent search snippets:
         {social_raw}
         
         Summarize the "Social Buzz":
@@ -391,7 +415,8 @@ if search_btn and user_query:
         """
 
     # --- DISPLAY DASHBOARD ---
-    st.subheader(f"{info.get('longName', ticker_to_use)} ({ticker_to_use})")
+    st.divider()
+    st.subheader(f"📊 Report: {info.get('longName', ticker_to_analyze)} ({ticker_to_analyze})")
     
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Current Price", f"{current_price:.2f} {info.get('currency', '')}")
@@ -402,7 +427,6 @@ if search_btn and user_query:
     st.markdown("---")
 
     with st.spinner("🤖 Simulating Analyst Roundtable..."):
-        # Calling AI with new robust function
         fund_analysis = get_gemini_response(fund_prompt, api_key)
         tech_analysis = get_gemini_response(tech_prompt, api_key)
         social_analysis = get_gemini_response(social_prompt, api_key)
@@ -430,7 +454,7 @@ if search_btn and user_query:
                 <div style='padding: 20px; background-color: #2b2121; border-radius: 5px; border: 1px solid #da3633;'>
                     <h4 style='color: #da3633; margin:0;'>❌ No High-Probability Confluence Found</h4>
                     <p style='margin-top: 10px;'>The scan was run across all timeframe pairs (1H/4H, 1D/1W, etc.).<br>
-                    No pairs currently show simultaneous <b>Unmitigated Bullish FVGs</b> within the strict proximity thresholds defined.</p>
+                    No pairs currently show simultaneous <b>Unmitigated Bullish FVGs</b> within the strict proximity thresholds.</p>
                 </div>
             """, unsafe_allow_html=True)
 
@@ -440,8 +464,8 @@ if search_btn and user_query:
         
     with tab_tech:
         st.markdown("### 🔭 Technical Structure")
-        fig = go.Figure(data=[go.Candlestick(x=history.index, open=history['Open'], high=history['High'], low=history['Low'], close=history['Close'], name=ticker_to_use)])
-        fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, title=f"{ticker_to_use} Daily Chart")
+        fig = go.Figure(data=[go.Candlestick(x=history.index, open=history['Open'], high=history['High'], low=history['Low'], close=history['Close'], name=ticker_to_analyze)])
+        fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, title=f"{ticker_to_analyze} Daily Chart")
         st.plotly_chart(fig, use_container_width=True)
         st.markdown("#### AI Technical Commentary")
         st.markdown(tech_analysis)
