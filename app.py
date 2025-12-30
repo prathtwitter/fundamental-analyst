@@ -4,6 +4,7 @@ import google.generativeai as genai
 from duckduckgo_search import DDGS
 import pandas as pd
 import plotly.graph_objects as go
+import re
 from datetime import datetime, timedelta
 
 # --- PAGE CONFIGURATION ---
@@ -74,7 +75,7 @@ st.markdown("""
 with st.sidebar:
     st.header("⚙️ Control Panel")
     
-    # 1. API Key Logic (Auto-load from Secrets or Manual Input)
+    # 1. API Key Logic
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("🔒 API Key Loaded Securely")
@@ -82,31 +83,25 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key", type="password", help="Enter your Google Gemini API Key")
     
     st.markdown("---")
-    region = st.selectbox("Select Region", ["USA 🇺🇸", "India 🇮🇳", "Canada 🇨🇦"])
+    region_selection = st.selectbox("Select Market Region", ["USA 🇺🇸", "India 🇮🇳", "Canada 🇨🇦"])
     
-    # Suffix logic for yfinance
-    suffix_map = {"USA 🇺🇸": "", "India 🇮🇳": ".NS", "Canada 🇨🇦": ".TO"}
-    suffix = suffix_map[region]
-    
-    st.info("💡 **Tip:**\nUSA: AAPL, MSFT\nIndia: RELIANCE, TCS\nCanada: SHOP, RY")
+    # Region mapping for search context
+    region_map = {"USA 🇺🇸": "USA", "India 🇮🇳": "India", "Canada 🇨🇦": "Canada"}
+    selected_country = region_map[region_selection]
 
 # --- MAIN HEADER ---
 st.title("♟️ Company Analyzer")
-st.markdown("*Strategic Fundamental & Technical Deep Dive powered by AI*")
+st.markdown(f"*Strategic Deep Dive | Region: {selected_country}*")
 st.markdown("---")
 
 # --- FVG ENGINE (Strategic Sniper Logic) ---
 class FVG_Engine:
     @staticmethod
     def resample_data(df, interval):
-        """Resamples basic data into custom timeframes (4H, 6M, 12M)."""
         if df is None or df.empty: return None
-        
-        logic = {
-            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-        }
+        # Drop NaN to ensure clean candles
+        logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
         try:
-            # Drop NaN rows to prevent calculation errors
             resampled = df.resample(interval).agg(logic).dropna()
             return resampled
         except Exception as e:
@@ -116,49 +111,47 @@ class FVG_Engine:
     def find_bullish_fvgs(df, strict_mitigation=True):
         """
         Identifies Bullish FVGs (Candle 1 High < Candle 3 Low).
-        Strict Logic: Invalid if ANY future candle wicks into the gap.
+        STRICT CRITERIA:
+        - Current forming candle is ignored.
+        - Invalid if ANY future candle wicks into the gap (Low <= Top).
         """
         fvgs = []
         if df is None or len(df) < 3: return fvgs
 
-        # Iterate through candles (leaving space for 3-candle pattern)
+        # Iterate up to len-1 to ignore the very last forming candle if needed
+        # We stop at len - 2 because we need i, i+1, i+2 closed candles
         for i in range(len(df) - 2):
             c1 = df.iloc[i]
-            c2 = df.iloc[i+1] # The big move candle
+            c2 = df.iloc[i+1] # The displacement candle
             c3 = df.iloc[i+2]
             
-            # FVG Condition: Gap between C1 High and C3 Low
-            # Also ensure C2 is bullish (Close > Open) for valid context
+            # 1. Basic Structure: Gap Exists AND Displacement Candle is Green
             if c3['Low'] > c1['High'] and c2['Close'] > c2['Open']:
                 top = c3['Low']
                 bottom = c1['High']
                 avg_price = (top + bottom) / 2
                 
                 is_valid = True
+                
+                # 2. Strict Mitigation Check
                 if strict_mitigation:
-                    # Check ALL subsequent candles for mitigation
+                    # Check ALL subsequent candles after C3
                     future_candles = df.iloc[i+3:]
                     if not future_candles.empty:
                         min_low = future_candles['Low'].min()
-                        # If any future Low goes below the Top of the gap, it is mitigated
+                        # If any future Low touches or goes below the Top of the FVG, it is mitigated
                         if min_low <= top:
                             is_valid = False
                 
                 if is_valid:
-                    fvgs.append({
-                        'date': df.index[i+1], # Date of the big move
-                        'top': top,
-                        'bottom': bottom,
-                        'avg': avg_price
-                    })
+                    fvgs.append({'date': df.index[i+1], 'top': top, 'bottom': bottom, 'avg': avg_price})
         return fvgs
 
     @staticmethod
     def check_proximity(current_price, fvgs, threshold_pct):
-        """Checks if current price is within X% of any FVG Top."""
         matches = []
         for fvg in fvgs:
-            # Distance from FVG Top
+            # Distance from FVG Top (Support Level)
             dist_pct = abs(current_price - fvg['top']) / current_price
             if dist_pct <= threshold_pct:
                 matches.append(fvg)
@@ -166,22 +159,54 @@ class FVG_Engine:
 
 # --- HELPER FUNCTIONS ---
 
-def get_gemini_response(prompt, api_key):
-    """Interacts with Gemini 1.5 Flash."""
+def find_ticker_from_name(company_name, country):
+    """Searches DuckDuckGo for the Yahoo Finance ticker."""
+    query = f"{company_name} {country} stock ticker site:finance.yahoo.com"
     try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=1))
+            if results:
+                title = results[0]['title']
+                # Regex to find Ticker in parentheses e.g. "Reliance Industries (RELIANCE.NS)"
+                match = re.search(r'\((?P<ticker>[A-Z0-9.-]+)\)', title)
+                if match:
+                    return match.group('ticker')
+    except Exception as e:
+        return None
+    return None
+
+def get_gemini_response(prompt, api_key):
+    """
+    Robust AI Call function mimicking the logic from the working CFA drill code.
+    """
+    try:
+        # 1. Configure
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # 2. Config similar to reference code
+        generation_config = genai.types.GenerationConfig(temperature=0.7)
+        
+        # 3. Model Initialization
+        # We use 'gemini-1.5-flash' as it is the stable flash model. 
+        # If your reference code used '2.5', it might be a typo for '1.5' or a specific beta.
+        # 'gemini-1.5-flash' is generally the safest string for this model class.
+        model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
+        
+        # 4. Generate
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Error connecting to Gemini: {e}"
+        return f"**Error connecting to Gemini:** {e}"
 
 def fetch_financial_data(ticker_symbol):
-    """Fetches base financial data."""
     stock = yf.Ticker(ticker_symbol)
-    info = stock.info
-    
-    # Financial Statements (Wrapped in try/except for robustness)
+    try:
+        info = stock.info
+        if 'symbol' not in info:
+            return None, None, None, None, None, None
+    except:
+        return None, None, None, None, None, None
+
     try:
         balance_sheet = stock.balance_sheet
         income_stmt = stock.income_stmt
@@ -189,104 +214,123 @@ def fetch_financial_data(ticker_symbol):
     except:
         balance_sheet, income_stmt, cash_flow = None, None, None
     
-    # Standard History for Charting (1 Year)
+    # Get 1 year daily history for chart
     history_daily = stock.history(period="1y", interval="1d")
-    
     return stock, info, balance_sheet, income_stmt, cash_flow, history_daily
 
 def get_multi_tf_data(ticker_symbol):
-    """Fetches and resamples data for multi-timeframe FVG analysis."""
+    """
+    Fetches granular data and resamples to create custom timeframes 
+    (4H, 6M, 12M) required for FVG analysis.
+    """
     stock = yf.Ticker(ticker_symbol)
     
-    # 1. Fetch Base Data (Maximizing limits allowed by yfinance)
-    df_1h = stock.history(period="730d", interval="1h") # Max available for hourly
-    df_1d = stock.history(period="5y", interval="1d")   # Need long history for Year/Month resampling
-    df_1mo = stock.history(period="max", interval="1mo") # Max history for monthly
+    # Fetch base datasets
+    df_1h = stock.history(period="730d", interval="1h") # Max allowed for hourly
+    df_1d = stock.history(period="5y", interval="1d")   
+    df_1mo = stock.history(period="max", interval="1mo") 
 
     data_map = {}
     
-    # 2. Process Timeframes
+    # Process Hourly & 4H
     if not df_1h.empty:
         data_map['1H'] = df_1h
         data_map['4H'] = FVG_Engine.resample_data(df_1h, '4h')
     
+    # Process Daily & Weekly
     if not df_1d.empty:
         data_map['1D'] = df_1d
-        data_map['1W'] = FVG_Engine.resample_data(df_1d, 'W-FRI') # Weekly ending Friday
-        
+        data_map['1W'] = FVG_Engine.resample_data(df_1d, 'W-FRI') 
+    
+    # Process Monthly & larger
     if not df_1mo.empty:
         data_map['1M'] = df_1mo
-        data_map['3M'] = FVG_Engine.resample_data(df_1mo, '3ME')  # Quarterly end
-        data_map['6M'] = FVG_Engine.resample_data(df_1mo, '6ME')  # Semi-Annual end
-        data_map['12M'] = FVG_Engine.resample_data(df_1mo, '12ME') # Yearly end
-
+        data_map['3M'] = FVG_Engine.resample_data(df_1mo, '3ME')  
+        data_map['6M'] = FVG_Engine.resample_data(df_1mo, '6ME')  
+        data_map['12M'] = FVG_Engine.resample_data(df_1mo, '12ME') 
+        
     return data_map
 
 def get_social_buzz(query_term):
-    """Scrapes news and text using DuckDuckGo."""
     results = []
     try:
         with DDGS() as ddgs:
-            # News Search
+            # News
             news_gen = ddgs.news(query_term, timelimit="w", max_results=3)
             for r in news_gen: results.append(f"Title: {r['title']} | Source: {r['source']}")
-            
-            # Text Search (Reddit/X context)
+            # Discussions
             text_gen = ddgs.text(f"{query_term} stock sentiment site:reddit.com OR site:x.com", timelimit="w", max_results=3)
             for r in text_gen: results.append(f"Snippet: {r['body']}")
     except Exception as e:
         results.append(f"Could not fetch live social data: {e}")
     return "\n".join(results)
 
-# --- MAIN APPLICATION LOGIC ---
+# --- SEARCH & INPUT LOGIC ---
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    ticker_input = st.text_input("Enter Company Ticker", placeholder="Type ticker here (e.g. MSFT)...")
-with col2:
-    run_btn = st.button("Initialize Analysis", use_container_width=True)
+if 'found_ticker' not in st.session_state:
+    st.session_state.found_ticker = ""
 
-if run_btn and ticker_input:
+col_search_1, col_search_2 = st.columns([3, 1])
+
+with col_search_1:
+    user_query = st.text_input("Company Name / Ticker", placeholder="e.g. Reliance, Apple, Shopify...", value=st.session_state.found_ticker)
+
+with col_search_2:
+    search_btn = st.button("🔍 Find & Analyze", use_container_width=True)
+
+# --- EXECUTION LOGIC ---
+
+if search_btn and user_query:
     if not api_key:
         st.error("⚠️ API Key Missing. Please set it in sidebar or secrets.toml.")
         st.stop()
 
-    full_ticker = f"{ticker_input.upper().strip()}{suffix}" if suffix else ticker_input.upper().strip()
+    # 1. RESOLVE TICKER
+    ticker_to_use = user_query.strip().upper()
     
-    with st.spinner(f"Acquiring Target Data & Scanning Timeframes: {full_ticker}..."):
-        # 1. Fetch Fundamentals
-        stock, info, bs, inc, cf, history = fetch_financial_data(full_ticker)
+    # Heuristic: If spaced or lowercase or long, assume name and search
+    if " " in user_query or user_query.islower() or len(user_query) > 5:
+        with st.spinner(f"🔍 Searching ticker for '{user_query}' in {selected_country}..."):
+            found = find_ticker_from_name(user_query, selected_country)
+            if found:
+                ticker_to_use = found
+                st.session_state.found_ticker = found
+                st.success(f"Target Identified: {ticker_to_use}")
+            else:
+                st.error(f"Could not find a clear ticker for '{user_query}' in {selected_country}. Please try the exact symbol.")
+                st.stop()
+    
+    # 2. ANALYZE
+    with st.spinner(f"Acquiring Data: {ticker_to_use}..."):
+        stock, info, bs, inc, cf, history = fetch_financial_data(ticker_to_use)
         
-        if history.empty:
-            st.error(f"Could not fetch data for {full_ticker}. Check ticker/region.")
+        if stock is None or history.empty:
+            st.error(f"Could not retrieve financial data for symbol: {ticker_to_use}. It might be delisted or region mismatch.")
             st.stop()
             
         current_price = history['Close'].iloc[-1]
         
-        # 2. Fetch & Process Multi-Timeframe Data for FVG
-        tf_data = get_multi_tf_data(full_ticker)
+        # --- FVG SCANNING ---
+        tf_data = get_multi_tf_data(ticker_to_use)
         
-        # 3. Define FVG Scan Criteria (Pairs & Proximity)
+        # Specific Pairs & Percentages from your Requirement Image
         # Format: (Pair Name, TF1, TF2, Prox1, Prox2)
         scan_pairs = [
-            ("1H & 4H", "1H", "4H", 0.01, 0.01),
-            ("1D & 1W", "1D", "1W", 0.02, 0.02),
-            ("1W & 1M", "1W", "1M", 0.02, 0.03),
-            ("1M & 3M", "1M", "3M", 0.03, 0.04),
-            ("3M & 6M", "3M", "6M", 0.04, 0.05),
-            ("6M & 12M", "6M", "12M", 0.05, 0.05),
+            ("1H & 4H", "1H", "4H", 0.01, 0.01),       # 1%
+            ("1D & 1W", "1D", "1W", 0.02, 0.02),       # 2%
+            ("1W & 1M", "1W", "1M", 0.02, 0.03),       # 2% & 3%
+            ("1M & 3M", "1M", "3M", 0.03, 0.04),       # 3% & 4%
+            ("3M & 6M", "3M", "6M", 0.04, 0.05),       # 4% & 5%
+            ("6M & 12M", "6M", "12M", 0.05, 0.05),     # 5%
         ]
         
-        # 4. Run FVG Logic
         fvg_results = []
         for pair_name, tf1_name, tf2_name, prox1, prox2 in scan_pairs:
-            # Verify data exists for both TFs
+            # Check if we have data for both timeframes
             if tf1_name in tf_data and tf2_name in tf_data and tf_data[tf1_name] is not None and tf_data[tf2_name] is not None:
-                # Find FVGs
                 fvgs_1 = FVG_Engine.find_bullish_fvgs(tf_data[tf1_name])
                 fvgs_2 = FVG_Engine.find_bullish_fvgs(tf_data[tf2_name])
                 
-                # Check Proximity
                 valid_1 = FVG_Engine.check_proximity(current_price, fvgs_1, prox1)
                 valid_2 = FVG_Engine.check_proximity(current_price, fvgs_2, prox2)
                 
@@ -294,15 +338,13 @@ if run_btn and ticker_input:
                     fvg_results.append({
                         "pair": pair_name,
                         "status": "CONFLUENCE DETECTED",
-                        "details": f"Price is within limits of Unmitigated Bullish FVGs on both {tf1_name} ({prox1*100}%) and {tf2_name} ({prox2*100}%).",
+                        "details": f"Price is within limits ({prox1*100}% & {prox2*100}%) of Unmitigated Bullish FVGs.",
                         "zones": (valid_1, valid_2)
                     })
         
-        # 5. Prepare Gemini Prompts
-        
-        # Fundamental Prompt
+        # --- PREPARE PROMPTS ---
         fund_prompt = f"""
-        You are an elite financial analyst. Analyze {full_ticker} (Price: {current_price}) based on these metrics:
+        You are an elite financial analyst. Analyze {ticker_to_use} (Price: {current_price}) based on these metrics:
         - Market Cap: {info.get('marketCap', 'N/A')}
         - P/E: {info.get('trailingPE', 'N/A')}, Forward P/E: {info.get('forwardPE', 'N/A')}
         - P/B: {info.get('priceToBook', 'N/A')}
@@ -321,10 +363,8 @@ if run_btn and ticker_input:
         Use Markdown. Professional tone.
         """
         
-        # Technical Prompt
-        # Passing last 30 days of OHLCV for context
         tech_prompt = f"""
-        You are a Chartered Market Technician (CMT). Analyze the technical structure of {full_ticker}.
+        You are a Chartered Market Technician (CMT). Analyze the technical structure of {ticker_to_use}.
         Current Price: {current_price}
         
         Recent OHLCV Data (Daily):
@@ -340,10 +380,9 @@ if run_btn and ticker_input:
         Provide a "Sniper's Verdict": Bullish, Bearish, or Neutral/Wait.
         """
         
-        # Social Prompt
-        social_raw = get_social_buzz(f"${ticker_input} stock")
+        social_raw = get_social_buzz(f"{ticker_to_use} stock")
         social_prompt = f"""
-        Analyze the sentiment for {full_ticker} based on these recent search snippets:
+        Analyze the sentiment for {ticker_to_use} based on these recent search snippets:
         {social_raw}
         
         Summarize the "Social Buzz":
@@ -352,33 +391,27 @@ if run_btn and ticker_input:
         """
 
     # --- DISPLAY DASHBOARD ---
-    st.subheader(f"{info.get('longName', full_ticker)} ({full_ticker})")
+    st.subheader(f"{info.get('longName', ticker_to_use)} ({ticker_to_use})")
     
-    # Metrics Bar
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Current Price", f"{current_price:.2f}")
+    m1.metric("Current Price", f"{current_price:.2f} {info.get('currency', '')}")
     m2.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
     m3.metric("52W High", f"{info.get('fiftyTwoWeekHigh', 0):.2f}")
     m4.metric("Recommendation", f"{info.get('recommendationKey', 'N/A').upper().replace('_', ' ')}")
     
     st.markdown("---")
 
-    # --- AI GENERATION ---
-    with st.spinner("🤖 Simulating Analyst Roundtable... (Fundamentals, Technicals, Sentiment)"):
-        # Parallel execution isn't native in basic Streamlit without async, 
-        # so we run sequential for stability.
+    with st.spinner("🤖 Simulating Analyst Roundtable..."):
+        # Calling AI with new robust function
         fund_analysis = get_gemini_response(fund_prompt, api_key)
         tech_analysis = get_gemini_response(tech_prompt, api_key)
         social_analysis = get_gemini_response(social_prompt, api_key)
 
-    # --- TABS LAYOUT ---
     tab_fvg, tab_fund, tab_tech, tab_soc = st.tabs(["🎯 FVG Sniper", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
     
     with tab_fvg:
         st.markdown("### 🎯 Fair Value Gap (FVG) Confluence Scanner")
-        st.markdown("""
-        > **Strict Criteria:** Bullish FVGs Only | Unmitigated (Virgin) Zones Only | Dual Timeframe Confluence
-        """)
+        st.markdown("> **Strict Criteria:** Bullish FVGs Only | Unmitigated (Virgin) Zones Only | Dual Timeframe Confluence")
         
         if fvg_results:
             for res in fvg_results:
@@ -397,7 +430,7 @@ if run_btn and ticker_input:
                 <div style='padding: 20px; background-color: #2b2121; border-radius: 5px; border: 1px solid #da3633;'>
                     <h4 style='color: #da3633; margin:0;'>❌ No High-Probability Confluence Found</h4>
                     <p style='margin-top: 10px;'>The scan was run across all timeframe pairs (1H/4H, 1D/1W, etc.).<br>
-                    No pairs currently show simultaneous <b>Unmitigated Bullish FVGs</b> within the strict proximity thresholds.</p>
+                    No pairs currently show simultaneous <b>Unmitigated Bullish FVGs</b> within the strict proximity thresholds defined.</p>
                 </div>
             """, unsafe_allow_html=True)
 
@@ -407,14 +440,8 @@ if run_btn and ticker_input:
         
     with tab_tech:
         st.markdown("### 🔭 Technical Structure")
-        # Interactive Chart
-        fig = go.Figure(data=[go.Candlestick(x=history.index, 
-                                             open=history['Open'], 
-                                             high=history['High'], 
-                                             low=history['Low'], 
-                                             close=history['Close'],
-                                             name=full_ticker)])
-        fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, title=f"{full_ticker} Daily Chart")
+        fig = go.Figure(data=[go.Candlestick(x=history.index, open=history['Open'], high=history['High'], low=history['Low'], close=history['Close'], name=ticker_to_use)])
+        fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, title=f"{ticker_to_use} Daily Chart")
         st.plotly_chart(fig, use_container_width=True)
         st.markdown("#### AI Technical Commentary")
         st.markdown(tech_analysis)
