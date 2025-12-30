@@ -37,8 +37,13 @@ st.markdown("""
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Control Panel")
+    
+    # API Key Handling (matching your CFA app pattern)
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
+        st.success("🔒 API Key Loaded Securely")
+    elif "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
         st.success("🔒 API Key Loaded Securely")
     else:
         api_key = st.text_input("Gemini API Key", type="password")
@@ -49,6 +54,16 @@ with st.sidebar:
     selected_country = region_map[region_selection]
     
     st.info("💡 **Ticker Guide:**\n- USA: `TSLA`, `AAPL`\n- India: `RELIANCE.NS`, `TCS.NS`\n- Canada: `SHOP.TO`, `RY.TO`")
+
+# --- GEMINI API SETUP (Matching your CFA app pattern) ---
+model = None
+if api_key:
+    try:
+        genai.configure(api_key=api_key)
+        generation_config = genai.types.GenerationConfig(temperature=0.7)
+        model = genai.GenerativeModel('gemini-2.5-flash', generation_config=generation_config)
+    except Exception as e:
+        st.sidebar.error(f"Model Error: {e}")
 
 # --- MAIN HEADER ---
 st.title("♟️ Company Analyzer")
@@ -129,11 +144,11 @@ def search_tickers_safe(query, country):
         return []
     return candidates
 
-def get_gemini_response(prompt, api_key):
+def get_gemini_response(prompt):
+    """Generate content using the global model instance (matching CFA app pattern)."""
+    if model is None:
+        return "**Error:** Model not initialized. Please provide API key."
     try:
-        genai.configure(api_key=api_key)
-        generation_config = genai.types.GenerationConfig(temperature=0.7)
-        model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -225,7 +240,11 @@ if ticker_to_analyze:
     
     if st.button("🚀 Launch Strategic Deep Dive", use_container_width=True):
         if not api_key:
-            st.error("⚠️ API Key Missing.")
+            st.error("⚠️ API Key Missing. Please add your Gemini API key in the sidebar.")
+            st.stop()
+        
+        if model is None:
+            st.error("⚠️ Model not initialized. Check your API key.")
             st.stop()
             
         with st.spinner(f"Running Multi-Timeframe FVG Scan & AI Analysis on {ticker_to_analyze}..."):
@@ -265,7 +284,7 @@ if ticker_to_analyze:
                             "zones": (valid_1, valid_2)
                         })
 
-            # 3. AI Analysis
+            # 3. AI Analysis (using global model like CFA app)
             fund_prompt = f"""
             Analyze {ticker_to_analyze} (Price: {current_price}) Metrics:
             - Market Cap: {info.get('marketCap', 'N/A')}
@@ -286,9 +305,9 @@ if ticker_to_analyze:
             soc_buzz = get_social_buzz(f"{ticker_to_analyze} stock")
             soc_prompt = f"Sentiment Analysis based on: {soc_buzz}"
             
-            fund_an = get_gemini_response(fund_prompt, api_key)
-            tech_an = get_gemini_response(tech_prompt, api_key)
-            soc_an = get_gemini_response(soc_prompt, api_key)
+            fund_an = get_gemini_response(fund_prompt)
+            tech_an = get_gemini_response(tech_prompt)
+            soc_an = get_gemini_response(soc_prompt)
 
             # --- DISPLAY RESULTS ---
             st.divider()
