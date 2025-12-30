@@ -77,9 +77,287 @@ if 'selected_ticker' not in st.session_state: st.session_state.selected_ticker =
 
 
 # ==========================================
-# MATH WIZ - EXACT COPY FROM WORKING SCANNER
+# FVG ENGINE - EXACT COPY FROM WORKING FVG SCANNER
 # ==========================================
+
+def calculate_bullish_fvgs(df):
+    """
+    Identifies ONLY Unmitigated Bullish FVGs (Support).
+    
+    STRICT RULES:
+    1. Formation: FVG (Candles i, i+1, i+2) is valid only if i+2 is a CLOSED candle.
+       We assume the last row of df (n-1) is the 'Current/Forming' candle.
+       Therefore, i+2 must be <= n-2.
+    
+    2. Mitigation (UPDATED): 
+       - An FVG is considered MITIGATED if any future CLOSED candle 'wicks' into the gap.
+       - Specifically: If Future Low <= Top of FVG, it is mitigated.
+       - We do not check the last row (current forming candle) for mitigation.
+    """
+    if df is None or len(df) < 4: 
+        return []
+
+    highs = df['High'].values
+    lows = df['Low'].values
+    
+    n = len(lows)
+    
+    # Pre-compute Future Mitigation (Closed Candles Only)
+    # min_future_low[k] = lowest Low of candles k, k+1, ... up to n-2
+    # EXCLUDE n-1 (Current Candle) from this check
+    min_future_low = np.full(n, np.inf)
+    current_min = np.inf
+    
+    # Start from n-2 (Last Closed Candle) down to 0
+    for i in range(n-2, -1, -1):
+        current_min = min(current_min, lows[i])
+        min_future_low[i] = current_min
+
+    unmitigated_fvgs = []
+
+    # Identify FVGs - trigger candle (i+2) must be closed (<= n-2)
+    scan_limit = n - 3
+    if scan_limit < 0:
+        return []
+
+    for i in range(scan_limit):
+        # Bullish FVG Condition: High[i] < Low[i+2]
+        if highs[i] < lows[i+2]:
+            bottom = highs[i]
+            top = lows[i+2]
+            
+            # Mitigation: If any future closed candle (i+3 to n-2) has Low <= Top
+            if i + 3 <= n - 2:
+                if min_future_low[i+3] <= top:
+                    continue  # Mitigated (Wicked into)
+            
+            unmitigated_fvgs.append((bottom, top))
+
+    return unmitigated_fvgs
+
+
+def calculate_bearish_fvgs(df):
+    """
+    Identifies ONLY Unmitigated Bearish FVGs (Resistance).
+    
+    STRICT RULES:
+    1. Formation: Bearish FVG when Low[i] > High[i+2]
+    2. Mitigation: If any future closed candle wicks into gap (High >= Bottom)
+    """
+    if df is None or len(df) < 4: 
+        return []
+
+    highs = df['High'].values
+    lows = df['Low'].values
+    
+    n = len(highs)
+    
+    # Pre-compute Future Mitigation (Closed Candles Only)
+    max_future_high = np.full(n, -np.inf)
+    current_max = -np.inf
+    
+    for i in range(n-2, -1, -1):
+        current_max = max(current_max, highs[i])
+        max_future_high[i] = current_max
+
+    unmitigated_fvgs = []
+
+    scan_limit = n - 3
+    if scan_limit < 0:
+        return []
+
+    for i in range(scan_limit):
+        # Bearish FVG Condition: Low[i] > High[i+2]
+        if lows[i] > highs[i+2]:
+            top = lows[i]
+            bottom = highs[i+2]
+            
+            # Mitigation: If any future closed candle (i+3 to n-2) has High >= Bottom
+            if i + 3 <= n - 2:
+                if max_future_high[i+3] >= bottom:
+                    continue  # Mitigated
+            
+            unmitigated_fvgs.append((bottom, top))
+
+    return unmitigated_fvgs
+
+
+def is_near_fvg(price, fvgs, threshold_pct):
+    """
+    Checks if price is within X% of any unmitigated FVG.
+    Returns True if:
+    1. Price is INSIDE the FVG, OR
+    2. Price is within threshold_pct of nearest edge
+    """
+    if not fvgs:
+        return False, None
+    
+    threshold = threshold_pct / 100.0
+    
+    for bot, top in fvgs:
+        # 1. Check if price is INSIDE the FVG
+        if bot <= price <= top:
+            return True, {'bottom': bot, 'top': top, 'status': 'INSIDE'}
+        
+        # 2. Check distance to nearest edge
+        dist_to_top = abs(price - top)
+        dist_to_bot = abs(price - bot)
+        min_dist = min(dist_to_top, dist_to_bot)
+        
+        if (min_dist / price) <= threshold:
+            return True, {'bottom': bot, 'top': top, 'status': 'NEAR', 'distance_pct': (min_dist / price) * 100}
+            
+    return False, None
+
+
+def resample_custom(df, timeframe):
+    """
+    Resamples data based on strict calendar rules - EXACT COPY FROM FVG SCANNER.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    agg_dict = {
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }
+    
+    if timeframe == '1D':
+        return df.resample('1D').agg(agg_dict).dropna()
+    
+    if timeframe == '4H':
+        return df.resample('4h').agg(agg_dict).dropna()
+
+    if timeframe == '1W':
+        return df.resample('W').agg(agg_dict).dropna()
+    
+    if timeframe == '1M':
+        return df.resample('ME').agg(agg_dict).dropna()
+        
+    # Monthly based custom timeframes
+    df['Year'] = df.index.year
+    df['Month'] = df.index.month
+    
+    if timeframe == '3M':
+        df['Group'] = (df['Month'] - 1) // 3
+        grouper = ['Year', 'Group']
+        
+    elif timeframe == '6M':
+        df['Group'] = (df['Month'] - 1) // 6
+        grouper = ['Year', 'Group']
+        
+    elif timeframe == '12M':
+        df['Group'] = 0 
+        grouper = ['Year']
+        
+    else:
+        return df 
+
+    resampled = df.groupby(grouper).agg(agg_dict).dropna()
+    resampled = resampled.sort_index()
+    return resampled
+
+
+# ==========================================
+# ANALYSIS ENGINE - USING CORRECT FVG LOGIC
+# ==========================================
+
+def analyze_fvg_confluence(ticker, df_1h, df_1d, df_1mo):
+    """
+    Analyzes FVG confluence across multiple timeframes using EXACT scanner logic.
+    Returns detailed results for each timeframe pair.
+    """
+    if df_1d is None or df_1d.empty:
+        return None
+    
+    current_price = df_1d['Close'].iloc[-1]
+    
+    # Prepare all timeframe dataframes
+    data_frames = {}
+    if df_1h is not None and not df_1h.empty:
+        data_frames['1H'] = df_1h
+        data_frames['4H'] = resample_custom(df_1h, '4H')
+    data_frames['1D'] = df_1d
+    data_frames['1W'] = resample_custom(df_1d, '1W')
+    if df_1mo is not None and not df_1mo.empty:
+        data_frames['1M'] = df_1mo
+        data_frames['3M'] = resample_custom(df_1mo, '3M')
+        data_frames['6M'] = resample_custom(df_1mo, '6M')
+        data_frames['12M'] = resample_custom(df_1mo, '12M')
+    
+    # Calculate FVGs for each timeframe
+    bullish_fvgs = {}
+    bearish_fvgs = {}
+    for tf, df in data_frames.items():
+        if df is not None and not df.empty:
+            bullish_fvgs[tf] = calculate_bullish_fvgs(df)
+            bearish_fvgs[tf] = calculate_bearish_fvgs(df)
+    
+    # Define confluence pairs with thresholds (EXACT FROM SCANNER)
+    confluence_pairs = [
+        ('1H', '4H', 1.0, 1.0),
+        ('1D', '1W', 2.0, 2.0),
+        ('1W', '1M', 2.0, 3.0),
+        ('1M', '3M', 3.0, 4.0),
+        ('3M', '6M', 4.0, 5.0),
+        ('6M', '12M', 5.0, 5.0),
+    ]
+    
+    results = {
+        'current_price': current_price,
+        'bullish_confluence': {},
+        'bearish_confluence': {},
+        'bullish_fvg_counts': {},
+        'bearish_fvg_counts': {},
+    }
+    
+    # Store FVG counts
+    for tf in data_frames.keys():
+        results['bullish_fvg_counts'][tf] = len(bullish_fvgs.get(tf, []))
+        results['bearish_fvg_counts'][tf] = len(bearish_fvgs.get(tf, []))
+    
+    # Check each confluence pair
+    for tf1, tf2, thresh1, thresh2 in confluence_pairs:
+        pair_name = f"{tf1}, {tf2}"
+        
+        # Bullish confluence
+        if tf1 in bullish_fvgs and tf2 in bullish_fvgs:
+            near1, zone1 = is_near_fvg(current_price, bullish_fvgs[tf1], thresh1)
+            near2, zone2 = is_near_fvg(current_price, bullish_fvgs[tf2], thresh2)
+            
+            if near1 and near2:
+                results['bullish_confluence'][pair_name] = {
+                    'detected': True,
+                    'tf1_zone': zone1,
+                    'tf2_zone': zone2,
+                    'thresholds': (thresh1, thresh2)
+                }
+        
+        # Bearish confluence
+        if tf1 in bearish_fvgs and tf2 in bearish_fvgs:
+            near1, zone1 = is_near_fvg(current_price, bearish_fvgs[tf1], thresh1)
+            near2, zone2 = is_near_fvg(current_price, bearish_fvgs[tf2], thresh2)
+            
+            if near1 and near2:
+                results['bearish_confluence'][pair_name] = {
+                    'detected': True,
+                    'tf1_zone': zone1,
+                    'tf2_zone': zone2,
+                    'thresholds': (thresh1, thresh2)
+                }
+    
+    return results
+
+
 class MathWiz:
+    """Additional technical analysis utilities."""
+    
     @staticmethod
     def identify_strict_swings(df, neighbor_count=3):
         """Identify swing highs and swing lows."""
@@ -93,13 +371,6 @@ class MathWiz:
             is_swing_low &= (df['Low'] < df['Low'].shift(-i))
             
         return is_swing_high, is_swing_low
-
-    @staticmethod
-    def find_fvg(df):
-        """Find Fair Value Gaps - EXACT LOGIC FROM SCANNER."""
-        bull_fvg = (df['Low'] > df['High'].shift(2))
-        bear_fvg = (df['High'] < df['Low'].shift(2))
-        return bull_fvg, bear_fvg
     
     @staticmethod
     def check_ifvg_reversal(df):
@@ -126,40 +397,6 @@ class MathWiz:
         return None
 
     @staticmethod
-    def find_unmitigated_fvg_zone(df, threshold_pct=0.05):
-        """Check if price is near an unmitigated FVG zone - EXACT LOGIC FROM SCANNER."""
-        if len(df) < 5: return False, None
-        current_price = df['Close'].iloc[-1]
-        lookback = min(len(df), 50)
-        
-        for i in range(len(df)-1, max(len(df)-lookback, 2), -1):
-            curr_low = df['Low'].iloc[i]
-            prev_high = df['High'].iloc[i-2]
-            
-            # Bullish FVG: Current candle's low > candle 2 bars ago high
-            if curr_low > prev_high: 
-                gap_top = curr_low
-                gap_bottom = prev_high
-                
-                # Check if gap has been mitigated (price went below gap_bottom)
-                subsequent_data = df.iloc[i+1:]
-                if not subsequent_data.empty:
-                    if (subsequent_data['Low'] < gap_bottom).any():
-                        continue  # Gap was mitigated, skip
-                
-                # Check if current price is within threshold of gap bottom
-                upper_bound = gap_bottom * (1 + threshold_pct)
-                lower_bound = gap_bottom * (1 - threshold_pct)
-                if lower_bound <= current_price <= upper_bound:
-                    return True, {
-                        'date': df.index[i],
-                        'gap_top': gap_top,
-                        'gap_bottom': gap_bottom,
-                        'current_price': current_price
-                    }
-        return False, None
-
-    @staticmethod
     def check_consecutive_candles(df, num_candles):
         """Check for consecutive red or green candles."""
         if len(df) < num_candles:
@@ -170,9 +407,9 @@ class MathWiz:
         all_green = all(recent['Close'] > recent['Open'])
         
         if all_red:
-            return 'Bull'  # Reversal candidate
+            return 'Bull'
         elif all_green:
-            return 'Bear'  # Reversal candidate
+            return 'Bear'
         
         return None
 
@@ -197,192 +434,6 @@ class MathWiz:
             return 100 * (numerator / denominator)
         except:
             return pd.Series(dtype='float64')
-
-
-# ==========================================
-# DATA ENGINE - EXACT COPY FROM SCANNER
-# ==========================================
-def resample_custom(df, timeframe):
-    """Resample data to different timeframes - EXACT LOGIC FROM SCANNER."""
-    if df.empty: return df
-    agg_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-    try:
-        if timeframe == "1D": return df.resample("1D").agg(agg_dict).dropna()
-        if timeframe == "1W": return df.resample("W-FRI").agg(agg_dict).dropna()
-        if timeframe == "1M": return df.resample("ME").agg(agg_dict).dropna()
-
-        df_monthly = df.resample('MS').agg(agg_dict).dropna()
-        if timeframe == "3M": return df_monthly.resample('QE').agg(agg_dict).dropna()
-        if timeframe == "6M":
-            df_monthly['Year'] = df_monthly.index.year
-            df_monthly['Half'] = np.where(df_monthly.index.month <= 6, 1, 2)
-            df_6m = df_monthly.groupby(['Year', 'Half']).agg(agg_dict)
-            new_index = []
-            for (year, half) in df_6m.index:
-                month = 6 if half == 1 else 12
-                new_index.append(pd.Timestamp(year=year, month=month, day=30))
-            df_6m.index = pd.DatetimeIndex(new_index)
-            return df_6m.sort_index()
-        if timeframe == "12M": return df_monthly.resample('YE').agg(agg_dict).dropna()
-    except: return df
-    return df
-
-
-# ==========================================
-# ANALYSIS ENGINE - EXACT LOGIC FROM SCANNER
-# ==========================================
-def analyze_single_ticker(ticker, df_daily_raw, df_monthly_raw):
-    """Runs ALL scans for ONE ticker - EXACT LOGIC FROM SCANNER."""
-    results = {
-        'Ticker': ticker,
-        'Price': 0,
-        # Bullish signals
-        'Bull_OB_1D': False, 'Bull_OB_1W': False, 'Bull_OB_1M': False,
-        'Bull_FVG_1D': False, 'Bull_FVG_1W': False, 'Bull_FVG_1M': False,
-        'Bull_RevCand_1D': False, 'Bull_RevCand_1W': False, 'Bull_RevCand_1M': False,
-        'Bull_iFVG_1D': False, 'Bull_iFVG_1W': False, 'Bull_iFVG_1M': False,
-        'Support_3M': False, 'Support_6M': False, 'Support_12M': False,
-        'Squeeze_1D': False, 'Squeeze_1W': False,
-        # Bearish signals
-        'Bear_OB_1D': False, 'Bear_OB_1W': False, 'Bear_OB_1M': False,
-        'Bear_FVG_1D': False, 'Bear_FVG_1W': False, 'Bear_FVG_1M': False,
-        'Bear_RevCand_1D': False, 'Bear_RevCand_1W': False, 'Bear_RevCand_1M': False,
-        'Bear_iFVG_1D': False, 'Bear_iFVG_1W': False, 'Bear_iFVG_1M': False,
-        'Exhaustion': False,
-        # Confluence tracking
-        'support_zones': [],
-        'bullish_count': 0,
-        'bearish_count': 0
-    }
-    
-    try:
-        d_1d = resample_custom(df_daily_raw, "1D")
-        d_1w = resample_custom(df_daily_raw, "1W")
-        d_1m = resample_custom(df_monthly_raw, "1M")
-        d_3m = resample_custom(df_monthly_raw, "3M")
-        d_6m = resample_custom(df_monthly_raw, "6M")
-        d_12m = resample_custom(df_monthly_raw, "12M")
-        
-        data_map = {"1D": d_1d, "1W": d_1w, "1M": d_1m, "3M": d_3m, "6M": d_6m, "12M": d_12m}
-        
-        if not d_1d.empty:
-            results['Price'] = round(d_1d['Close'].iloc[-1], 2)
-        
-    except: 
-        return results
-
-    # --- SCAN EACH TIMEFRAME (1D, 1W, 1M) ---
-    for tf in ["1D", "1W", "1M"]:
-        if tf not in data_map or len(data_map[tf]) < 5: continue
-        
-        df = data_map[tf].copy() 
-        df['Bull_FVG'], df['Bear_FVG'] = MathWiz.find_fvg(df)
-        df['Is_Swing_High'], df['Is_Swing_Low'] = MathWiz.identify_strict_swings(df)
-        
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # --- BULLISH FVG + Swing Break ---
-        if curr['Bull_FVG']:
-            past_swings = df[df['Is_Swing_High']]
-            if not past_swings.empty:
-                last_swing_high = past_swings['High'].iloc[-1]
-                if curr['Close'] > last_swing_high and prev['Close'] <= last_swing_high:
-                    results[f'Bull_FVG_{tf}'] = True
-
-        # --- BEARISH FVG + Swing Break ---
-        if curr['Bear_FVG']:
-            past_swings = df[df['Is_Swing_Low']]
-            if not past_swings.empty:
-                last_swing_low = past_swings['Low'].iloc[-1]
-                if curr['Close'] < last_swing_low and prev['Close'] >= last_swing_low:
-                    results[f'Bear_FVG_{tf}'] = True
-
-        # --- BULLISH ORDER BLOCK: 1 bearish + 3 bullish + FVG ---
-        subset = df.iloc[-4:].copy()
-        if len(subset) == 4:
-            c1, c2, c3, c4 = subset.iloc[0], subset.iloc[1], subset.iloc[2], subset.iloc[3]
-            c1_bearish = c1['Close'] < c1['Open']
-            c2_bullish = c2['Close'] > c2['Open']
-            c3_bullish = c3['Close'] > c3['Open']
-            c4_bullish = c4['Close'] > c4['Open']
-            c4_has_bull_fvg = c4['Low'] > c2['High']
-            
-            if c1_bearish and c2_bullish and c3_bullish and c4_bullish and c4_has_bull_fvg:
-                results[f'Bull_OB_{tf}'] = True
-
-        # --- BEARISH ORDER BLOCK: 1 bullish + 3 bearish + FVG ---
-        if len(subset) == 4:
-            c1_bullish = c1['Close'] > c1['Open']
-            c2_bearish = c2['Close'] < c2['Open']
-            c3_bearish = c3['Close'] < c3['Open']
-            c4_bearish = c4['Close'] < c4['Open']
-            c4_has_bear_fvg = c4['High'] < c2['Low']
-            
-            if c1_bullish and c2_bearish and c3_bearish and c4_bearish and c4_has_bear_fvg:
-                results[f'Bear_OB_{tf}'] = True
-        
-        # --- iFVG Reversal ---
-        ifvg_status = MathWiz.check_ifvg_reversal(df)
-        if ifvg_status == "Bull":
-            results[f'Bull_iFVG_{tf}'] = True
-        elif ifvg_status == "Bear":
-            results[f'Bear_iFVG_{tf}'] = True
-
-    # --- SUPPORT ZONES (Higher TFs: 3M, 6M, 12M) ---
-    support_zones = []
-    for tf_name, tf_df in [("3M", d_3m), ("6M", d_6m), ("12M", d_12m)]:
-        found, zone_data = MathWiz.find_unmitigated_fvg_zone(tf_df)
-        if found:
-            results[f'Support_{tf_name}'] = True
-            support_zones.append({'timeframe': tf_name, 'zone': zone_data})
-    
-    results['support_zones'] = support_zones
-
-    # --- SQUEEZE (Choppiness > 59) ---
-    if not d_1d.empty:
-        chop_series_d = MathWiz.calculate_choppiness(d_1d['High'], d_1d['Low'], d_1d['Close'])
-        if not chop_series_d.empty and not pd.isna(chop_series_d.iloc[-1]):
-            if chop_series_d.iloc[-1] > 59:
-                results['Squeeze_1D'] = True
-                
-    if not d_1w.empty:
-        chop_series_w = MathWiz.calculate_choppiness(d_1w['High'], d_1w['Low'], d_1w['Close'])
-        if not chop_series_w.empty and not pd.isna(chop_series_w.iloc[-1]):
-            if chop_series_w.iloc[-1] > 59:
-                results['Squeeze_1W'] = True
-
-    # --- EXHAUSTION (Choppiness < 25 on Weekly) ---
-    if not d_1w.empty:
-        chop_series = MathWiz.calculate_choppiness(d_1w['High'], d_1w['Low'], d_1w['Close'])
-        if not chop_series.empty and not pd.isna(chop_series.iloc[-1]):
-            if chop_series.iloc[-1] < 25:
-                results['Exhaustion'] = True
-
-    # --- REVERSAL CANDIDATES (Consecutive Candles) ---
-    if not d_1d.empty and len(d_1d) >= 5:
-        rev = MathWiz.check_consecutive_candles(d_1d, 5)
-        if rev == 'Bull': results['Bull_RevCand_1D'] = True
-        elif rev == 'Bear': results['Bear_RevCand_1D'] = True
-    
-    if not d_1w.empty and len(d_1w) >= 4:
-        rev = MathWiz.check_consecutive_candles(d_1w, 4)
-        if rev == 'Bull': results['Bull_RevCand_1W'] = True
-        elif rev == 'Bear': results['Bear_RevCand_1W'] = True
-    
-    if not d_1m.empty and len(d_1m) >= 3:
-        rev = MathWiz.check_consecutive_candles(d_1m, 3)
-        if rev == 'Bull': results['Bull_RevCand_1M'] = True
-        elif rev == 'Bear': results['Bear_RevCand_1M'] = True
-
-    # --- COUNT SIGNALS ---
-    bull_keys = [k for k in results.keys() if k.startswith('Bull_') or k.startswith('Support_') or k.startswith('Squeeze_')]
-    bear_keys = [k for k in results.keys() if k.startswith('Bear_') or k == 'Exhaustion']
-    
-    results['bullish_count'] = sum(1 for k in bull_keys if results.get(k, False))
-    results['bearish_count'] = sum(1 for k in bear_keys if results.get(k, False))
-
-    return results
 
 
 # ==========================================
@@ -425,11 +476,15 @@ def fetch_financial_data(ticker_symbol):
         info = stock.info
     except:
         info = {}
-    history_daily = stock.history(period="2y", interval="1d")
+    
+    # Fetch all required timeframes
+    history_1h = stock.history(period="730d", interval="1h")
+    history_daily = stock.history(period="max", interval="1d")
     history_monthly = stock.history(period="max", interval="1mo")
+    
     if history_daily.empty:
-        return None, None, None, None
-    return stock, info, history_daily, history_monthly
+        return None, None, None, None, None
+    return stock, info, history_1h, history_daily, history_monthly
 
 def get_social_sentiment_data(ticker, company_name=""):
     """Fetches news and social mentions for sentiment analysis."""
@@ -554,15 +609,15 @@ if ticker_to_analyze:
         with st.spinner(f"Running Multi-Timeframe Analysis on {ticker_to_analyze}..."):
             
             # 1. Fetch Data
-            stock, info, history_daily, history_monthly = fetch_financial_data(ticker_to_analyze)
+            stock, info, history_1h, history_daily, history_monthly = fetch_financial_data(ticker_to_analyze)
             if history_daily is None:
                 st.error(f"❌ Could not load data for {ticker_to_analyze}. Check if ticker is correct for Region: {selected_country}.")
                 st.stop()
             
             current_price = history_daily['Close'].iloc[-1]
             
-            # 2. Run Full Analysis (EXACT SCANNER LOGIC)
-            scan_results = analyze_single_ticker(ticker_to_analyze, history_daily, history_monthly)
+            # 2. Run FVG Confluence Analysis (EXACT SCANNER LOGIC)
+            fvg_results = analyze_fvg_confluence(ticker_to_analyze, history_1h, history_daily, history_monthly)
 
             # 3. AI Analysis
             fund_prompt = f"""
@@ -631,18 +686,42 @@ if ticker_to_analyze:
             
             # 4. Generate Dashboard Summary (NEW)
             # Prepare FVG confluence info for dashboard
-            support_tfs = [tf for tf in ['3M', '6M', '12M'] if scan_results.get(f'Support_{tf}')]
-            fvg_confluence_str = ', '.join(support_tfs) if len(support_tfs) >= 2 else "None"
+            bullish_conf_pairs = list(fvg_results['bullish_confluence'].keys()) if fvg_results else []
+            bearish_conf_pairs = list(fvg_results['bearish_confluence'].keys()) if fvg_results else []
             
-            bullish_signals_str = []
-            bearish_signals_str = []
-            for tf in ['1D', '1W', '1M']:
-                if scan_results.get(f'Bull_OB_{tf}'): bullish_signals_str.append(f"OB({tf})")
-                if scan_results.get(f'Bull_FVG_{tf}'): bullish_signals_str.append(f"FVG({tf})")
-                if scan_results.get(f'Bull_iFVG_{tf}'): bullish_signals_str.append(f"iFVG({tf})")
-                if scan_results.get(f'Bear_OB_{tf}'): bearish_signals_str.append(f"OB({tf})")
-                if scan_results.get(f'Bear_FVG_{tf}'): bearish_signals_str.append(f"FVG({tf})")
-                if scan_results.get(f'Bear_iFVG_{tf}'): bearish_signals_str.append(f"iFVG({tf})")
+            fvg_confluence_str = ', '.join(bullish_conf_pairs) if bullish_conf_pairs else "None"
+            bearish_confluence_str = ', '.join(bearish_conf_pairs) if bearish_conf_pairs else "None"
+            
+            # Get FVG counts
+            bull_fvg_counts = fvg_results.get('bullish_fvg_counts', {}) if fvg_results else {}
+            bear_fvg_counts = fvg_results.get('bearish_fvg_counts', {}) if fvg_results else {}
+            
+            # Calculate additional signals (iFVG, RevCand, Squeeze, etc.)
+            d_1d = resample_custom(history_daily, '1D')
+            d_1w = resample_custom(history_daily, '1W')
+            
+            squeeze_1d = False
+            squeeze_1w = False
+            exhaustion = False
+            
+            if not d_1d.empty:
+                chop_d = MathWiz.calculate_choppiness(d_1d['High'], d_1d['Low'], d_1d['Close'])
+                if not chop_d.empty and not pd.isna(chop_d.iloc[-1]):
+                    squeeze_1d = chop_d.iloc[-1] > 59
+                    
+            if not d_1w.empty:
+                chop_w = MathWiz.calculate_choppiness(d_1w['High'], d_1w['Low'], d_1w['Close'])
+                if not chop_w.empty and not pd.isna(chop_w.iloc[-1]):
+                    squeeze_1w = chop_w.iloc[-1] > 59
+                    exhaustion = chop_w.iloc[-1] < 25
+            
+            # Check for reversal candidates
+            rev_cand_1d = MathWiz.check_consecutive_candles(d_1d, 5) if not d_1d.empty and len(d_1d) >= 5 else None
+            rev_cand_1w = MathWiz.check_consecutive_candles(d_1w, 4) if not d_1w.empty and len(d_1w) >= 4 else None
+            
+            # Check for iFVG
+            ifvg_1d = MathWiz.check_ifvg_reversal(d_1d) if not d_1d.empty else None
+            ifvg_1w = MathWiz.check_ifvg_reversal(d_1w) if not d_1w.empty else None
             
             dashboard_prompt = f"""
             You are an elite equity research analyst. Create a PRECISE executive dashboard summary for {ticker_to_analyze}.
@@ -660,13 +739,18 @@ if ticker_to_analyze:
             TECHNICAL DATA (Last 30 days):
             {history_daily.tail(30).to_csv()}
             
-            FVG SCANNER RESULTS:
-            - Bullish Signals: {', '.join(bullish_signals_str) if bullish_signals_str else 'None'}
-            - Bearish Signals: {', '.join(bearish_signals_str) if bearish_signals_str else 'None'}
-            - HTF Support Confluence: {fvg_confluence_str}
-            - Daily Squeeze: {'Yes' if scan_results.get('Squeeze_1D') else 'No'}
-            - Weekly Squeeze: {'Yes' if scan_results.get('Squeeze_1W') else 'No'}
-            - Exhaustion Signal: {'Yes' if scan_results.get('Exhaustion') else 'No'}
+            FVG SCANNER RESULTS (Using Strict Unmitigated FVG Logic):
+            - Bullish FVG Confluence Pairs: {fvg_confluence_str}
+            - Bearish FVG Confluence Pairs: {bearish_confluence_str}
+            - Bullish FVG Counts by TF: {bull_fvg_counts}
+            - Bearish FVG Counts by TF: {bear_fvg_counts}
+            - Daily Squeeze (Chop>59): {'Yes' if squeeze_1d else 'No'}
+            - Weekly Squeeze (Chop>59): {'Yes' if squeeze_1w else 'No'}
+            - Exhaustion (Chop<25): {'Yes' if exhaustion else 'No'}
+            - Daily Reversal Candidate: {rev_cand_1d or 'None'}
+            - Weekly Reversal Candidate: {rev_cand_1w or 'None'}
+            - Daily iFVG: {ifvg_1d or 'None'}
+            - Weekly iFVG: {ifvg_1w or 'None'}
             
             NEWS & SOCIAL DATA:
             {social_context}
@@ -740,8 +824,8 @@ if ticker_to_analyze:
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Current Price", f"{current_price:.2f} {info.get('currency', '')}")
             m2.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
-            m3.metric("🐂 Bullish Signals", scan_results['bullish_count'])
-            m4.metric("🐻 Bearish Signals", scan_results['bearish_count'])
+            m3.metric("🐂 Bullish Confluences", len(bullish_conf_pairs))
+            m4.metric("🐻 Bearish Confluences", len(bearish_conf_pairs))
             
             t0, t1, t2, t3, t4 = st.tabs(["📊 Dashboard", "🎯 FVG Scanner", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
             
@@ -852,81 +936,139 @@ if ticker_to_analyze:
                 qs5.metric("Analyst", f"{info.get('recommendationKey', 'N/A').upper() if info.get('recommendationKey') else 'N/A'}")
             
             with t1:
-                st.markdown("### 🎯 Multi-Timeframe FVG Analysis")
-                st.caption("Using exact logic from Prath's Market Scanner")
+                st.markdown("### 🎯 Multi-Timeframe FVG Confluence Scanner")
+                st.caption("Using strict unmitigated FVG logic: Current candle ignored, mitigation = wick into gap")
                 
-                # --- BULLISH SIGNALS TABLE ---
-                st.markdown("#### 🐂 Bullish Signals")
+                # --- CONFLUENCE CRITERIA ---
+                st.markdown("""
+                **Confluence Criteria (Price must be near FVG on BOTH timeframes):**
+                | Pair | TF1 Threshold | TF2 Threshold |
+                |------|---------------|---------------|
+                | 1H, 4H | 1% | 1% |
+                | 1D, 1W | 2% | 2% |
+                | 1W, 1M | 2% | 3% |
+                | 1M, 3M | 3% | 4% |
+                | 3M, 6M | 4% | 5% |
+                | 6M, 12M | 5% | 5% |
+                """)
                 
-                bull_data = []
-                for tf in ['1D', '1W', '1M']:
-                    row = {
-                        'Timeframe': tf,
-                        'Order Block': '✅' if scan_results.get(f'Bull_OB_{tf}') else '❌',
-                        'FVG + Swing Break': '✅' if scan_results.get(f'Bull_FVG_{tf}') else '❌',
-                        'Reversal Cand': '✅' if scan_results.get(f'Bull_RevCand_{tf}') else '❌',
-                        'iFVG': '✅' if scan_results.get(f'Bull_iFVG_{tf}') else '❌',
-                    }
-                    bull_data.append(row)
+                st.divider()
                 
-                bull_df = pd.DataFrame(bull_data)
-                st.dataframe(bull_df, hide_index=True, use_container_width=True)
+                # --- BULLISH CONFLUENCE RESULTS ---
+                st.markdown("#### 🐂 Bullish FVG Confluence (Support Zones)")
                 
-                # --- SUPPORT ZONES (HTF Confluence) ---
-                st.markdown("#### 🏔️ Support Zones (Higher Timeframe Confluence)")
-                
-                support_found = []
-                for tf in ['3M', '6M', '12M']:
-                    if scan_results.get(f'Support_{tf}'):
-                        support_found.append(tf)
-                
-                if len(support_found) >= 2:
-                    st.success(f"✅ **CONFLUENCE DETECTED** - Price near unmitigated FVG zones on: {', '.join(support_found)}")
-                    if scan_results['support_zones']:
-                        with st.expander("View Zone Details", expanded=True):
-                            for zone in scan_results['support_zones']:
-                                st.json(zone)
-                elif len(support_found) == 1:
-                    st.warning(f"⚠️ Single timeframe support on {support_found[0]} - Not confluence (need 2+ TFs)")
+                if fvg_results and fvg_results['bullish_confluence']:
+                    for pair_name, data in fvg_results['bullish_confluence'].items():
+                        with st.expander(f"✅ {pair_name} - CONFLUENCE DETECTED", expanded=True):
+                            col1, col2 = st.columns(2)
+                            tf1, tf2 = pair_name.split(', ')
+                            with col1:
+                                st.markdown(f"**{tf1} Zone:**")
+                                zone1 = data['tf1_zone']
+                                st.write(f"- Bottom: ${zone1['bottom']:.2f}")
+                                st.write(f"- Top: ${zone1['top']:.2f}")
+                                st.write(f"- Status: {zone1['status']}")
+                            with col2:
+                                st.markdown(f"**{tf2} Zone:**")
+                                zone2 = data['tf2_zone']
+                                st.write(f"- Bottom: ${zone2['bottom']:.2f}")
+                                st.write(f"- Top: ${zone2['top']:.2f}")
+                                st.write(f"- Status: {zone2['status']}")
+                            st.info(f"Thresholds: {tf1}={data['thresholds'][0]}%, {tf2}={data['thresholds'][1]}%")
                 else:
-                    st.info("❌ No higher timeframe support zones detected")
+                    st.info("❌ No Bullish FVG Confluence detected at current price level.")
                 
-                # --- SQUEEZE ---
-                st.markdown("#### 🔄 Squeeze Status (Choppiness > 59)")
-                squeeze_col1, squeeze_col2 = st.columns(2)
-                with squeeze_col1:
-                    if scan_results.get('Squeeze_1D'):
+                # --- FVG COUNTS BY TIMEFRAME ---
+                st.markdown("#### 📊 Unmitigated Bullish FVG Count by Timeframe")
+                if fvg_results:
+                    fvg_df = pd.DataFrame([{
+                        'Timeframe': tf,
+                        'Bullish FVGs': count
+                    } for tf, count in fvg_results['bullish_fvg_counts'].items()])
+                    st.dataframe(fvg_df, hide_index=True, use_container_width=True)
+                
+                st.divider()
+                
+                # --- BEARISH CONFLUENCE RESULTS ---
+                st.markdown("#### 🐻 Bearish FVG Confluence (Resistance Zones)")
+                
+                if fvg_results and fvg_results['bearish_confluence']:
+                    for pair_name, data in fvg_results['bearish_confluence'].items():
+                        with st.expander(f"✅ {pair_name} - CONFLUENCE DETECTED", expanded=True):
+                            col1, col2 = st.columns(2)
+                            tf1, tf2 = pair_name.split(', ')
+                            with col1:
+                                st.markdown(f"**{tf1} Zone:**")
+                                zone1 = data['tf1_zone']
+                                st.write(f"- Bottom: ${zone1['bottom']:.2f}")
+                                st.write(f"- Top: ${zone1['top']:.2f}")
+                                st.write(f"- Status: {zone1['status']}")
+                            with col2:
+                                st.markdown(f"**{tf2} Zone:**")
+                                zone2 = data['tf2_zone']
+                                st.write(f"- Bottom: ${zone2['bottom']:.2f}")
+                                st.write(f"- Top: ${zone2['top']:.2f}")
+                                st.write(f"- Status: {zone2['status']}")
+                            st.info(f"Thresholds: {tf1}={data['thresholds'][0]}%, {tf2}={data['thresholds'][1]}%")
+                else:
+                    st.info("❌ No Bearish FVG Confluence detected at current price level.")
+                
+                # --- BEARISH FVG COUNTS ---
+                st.markdown("#### 📊 Unmitigated Bearish FVG Count by Timeframe")
+                if fvg_results:
+                    bear_fvg_df = pd.DataFrame([{
+                        'Timeframe': tf,
+                        'Bearish FVGs': count
+                    } for tf, count in fvg_results['bearish_fvg_counts'].items()])
+                    st.dataframe(bear_fvg_df, hide_index=True, use_container_width=True)
+                
+                st.divider()
+                
+                # --- ADDITIONAL SIGNALS ---
+                st.markdown("#### 🔍 Additional Technical Signals")
+                
+                sig_col1, sig_col2, sig_col3 = st.columns(3)
+                
+                with sig_col1:
+                    st.markdown("**Squeeze (Chop > 59)**")
+                    if squeeze_1d:
                         st.success("✅ Daily Squeeze Active")
                     else:
                         st.info("❌ No Daily Squeeze")
-                with squeeze_col2:
-                    if scan_results.get('Squeeze_1W'):
+                    if squeeze_1w:
                         st.success("✅ Weekly Squeeze Active")
                     else:
                         st.info("❌ No Weekly Squeeze")
                 
-                st.divider()
+                with sig_col2:
+                    st.markdown("**Reversal Candidates**")
+                    if rev_cand_1d == 'Bull':
+                        st.success("✅ Daily: 5 Red Candles (Bullish Rev)")
+                    elif rev_cand_1d == 'Bear':
+                        st.error("⚠️ Daily: 5 Green Candles (Bearish Rev)")
+                    else:
+                        st.info("❌ No Daily Reversal Signal")
+                    
+                    if rev_cand_1w == 'Bull':
+                        st.success("✅ Weekly: 4 Red Candles (Bullish Rev)")
+                    elif rev_cand_1w == 'Bear':
+                        st.error("⚠️ Weekly: 4 Green Candles (Bearish Rev)")
+                    else:
+                        st.info("❌ No Weekly Reversal Signal")
                 
-                # --- BEARISH SIGNALS TABLE ---
-                st.markdown("#### 🐻 Bearish Signals")
-                
-                bear_data = []
-                for tf in ['1D', '1W', '1M']:
-                    row = {
-                        'Timeframe': tf,
-                        'Order Block': '✅' if scan_results.get(f'Bear_OB_{tf}') else '❌',
-                        'FVG + Swing Break': '✅' if scan_results.get(f'Bear_FVG_{tf}') else '❌',
-                        'Reversal Cand': '✅' if scan_results.get(f'Bear_RevCand_{tf}') else '❌',
-                        'iFVG': '✅' if scan_results.get(f'Bear_iFVG_{tf}') else '❌',
-                    }
-                    bear_data.append(row)
-                
-                bear_df = pd.DataFrame(bear_data)
-                st.dataframe(bear_df, hide_index=True, use_container_width=True)
-                
-                # --- EXHAUSTION ---
-                if scan_results.get('Exhaustion'):
-                    st.error("⚠️ **EXHAUSTION DETECTED** - Weekly Choppiness < 25 (Trend may reverse)")
+                with sig_col3:
+                    st.markdown("**iFVG & Exhaustion**")
+                    if ifvg_1d == 'Bull':
+                        st.success("✅ Daily Bullish iFVG")
+                    elif ifvg_1d == 'Bear':
+                        st.error("⚠️ Daily Bearish iFVG")
+                    else:
+                        st.info("❌ No Daily iFVG")
+                    
+                    if exhaustion:
+                        st.error("⚠️ **EXHAUSTION** (Weekly Chop < 25)")
+                    else:
+                        st.info("❌ No Exhaustion Signal")
             
             with t2: 
                 st.markdown(fund_an)
