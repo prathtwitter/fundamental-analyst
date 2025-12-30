@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import re
 import warnings
 import time
+import json
 
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(
@@ -627,6 +628,112 @@ if ticker_to_analyze:
             fund_an = get_gemini_response(fund_prompt)
             tech_an = get_gemini_response(tech_prompt)
             soc_an = get_gemini_response(soc_prompt)
+            
+            # 4. Generate Dashboard Summary (NEW)
+            # Prepare FVG confluence info for dashboard
+            support_tfs = [tf for tf in ['3M', '6M', '12M'] if scan_results.get(f'Support_{tf}')]
+            fvg_confluence_str = ', '.join(support_tfs) if len(support_tfs) >= 2 else "None"
+            
+            bullish_signals_str = []
+            bearish_signals_str = []
+            for tf in ['1D', '1W', '1M']:
+                if scan_results.get(f'Bull_OB_{tf}'): bullish_signals_str.append(f"OB({tf})")
+                if scan_results.get(f'Bull_FVG_{tf}'): bullish_signals_str.append(f"FVG({tf})")
+                if scan_results.get(f'Bull_iFVG_{tf}'): bullish_signals_str.append(f"iFVG({tf})")
+                if scan_results.get(f'Bear_OB_{tf}'): bearish_signals_str.append(f"OB({tf})")
+                if scan_results.get(f'Bear_FVG_{tf}'): bearish_signals_str.append(f"FVG({tf})")
+                if scan_results.get(f'Bear_iFVG_{tf}'): bearish_signals_str.append(f"iFVG({tf})")
+            
+            dashboard_prompt = f"""
+            You are an elite equity research analyst. Create a PRECISE executive dashboard summary for {ticker_to_analyze}.
+            
+            STOCK DATA:
+            - Current Price: ${current_price:.2f}
+            - Market Cap: {info.get('marketCap', 'N/A')}
+            - P/E: {info.get('trailingPE', 'N/A')}
+            - PEG: {info.get('pegRatio', 'N/A')}
+            - P/B: {info.get('priceToBook', 'N/A')}
+            - 52W High: {info.get('fiftyTwoWeekHigh', 'N/A')}
+            - 52W Low: {info.get('fiftyTwoWeekLow', 'N/A')}
+            - Analyst Recommendation: {info.get('recommendationKey', 'N/A')}
+            
+            TECHNICAL DATA (Last 30 days):
+            {history_daily.tail(30).to_csv()}
+            
+            FVG SCANNER RESULTS:
+            - Bullish Signals: {', '.join(bullish_signals_str) if bullish_signals_str else 'None'}
+            - Bearish Signals: {', '.join(bearish_signals_str) if bearish_signals_str else 'None'}
+            - HTF Support Confluence: {fvg_confluence_str}
+            - Daily Squeeze: {'Yes' if scan_results.get('Squeeze_1D') else 'No'}
+            - Weekly Squeeze: {'Yes' if scan_results.get('Squeeze_1W') else 'No'}
+            - Exhaustion Signal: {'Yes' if scan_results.get('Exhaustion') else 'No'}
+            
+            NEWS & SOCIAL DATA:
+            {social_context}
+            
+            Respond in EXACTLY this JSON format (no markdown, no code blocks, just raw JSON):
+            {{
+                "fundamentals_verdict": "One sentence verdict on fundamentals",
+                "fundamentals_rating": 7,
+                "whats_great": "One sentence on key strengths",
+                "whats_not_great": "One sentence on key weaknesses",
+                "value_buy": "Yes/No with brief reason",
+                "risk_level": "Low/Medium/High",
+                "technicals_verdict": "One sentence on technical setup",
+                "overall_trend": "Bullish/Bearish/Neutral with brief context",
+                "volume_analysis": "One sentence on volume patterns",
+                "support_analysis": "Key support level and strength",
+                "resistance_analysis": "Key resistance level and strength",
+                "chart_pattern": "Current pattern if any",
+                "fvg_confluence": "TFs with confluence or None",
+                "social_verdict": "One sentence sentiment verdict",
+                "sentiment_score": 7,
+                "sentiment_outlook": "One sentence actionable outlook",
+                "sentiment_drivers": "Top 2-3 drivers in one sentence",
+                "news_summary": "One sentence news sentiment",
+                "social_pulse": "One sentence Reddit/X sentiment",
+                "sentiment_risks": "Key contrarian risk in one sentence"
+            }}
+            
+            Be extremely precise and data-driven. No fluff. Every field must be filled.
+            """
+            
+            dashboard_raw = get_gemini_response(dashboard_prompt)
+            
+            # Parse dashboard JSON
+            try:
+                # Clean up response - remove markdown code blocks if present
+                clean_json = dashboard_raw.strip()
+                if clean_json.startswith("```"):
+                    clean_json = clean_json.split("```")[1]
+                    if clean_json.startswith("json"):
+                        clean_json = clean_json[4:]
+                clean_json = clean_json.strip()
+                dashboard_data = json.loads(clean_json)
+            except:
+                # Fallback if JSON parsing fails
+                dashboard_data = {
+                    "fundamentals_verdict": "Analysis pending - see Fundamentals tab",
+                    "fundamentals_rating": "N/A",
+                    "whats_great": "See detailed analysis",
+                    "whats_not_great": "See detailed analysis",
+                    "value_buy": "See detailed analysis",
+                    "risk_level": "Medium",
+                    "technicals_verdict": "Analysis pending - see Technicals tab",
+                    "overall_trend": "See chart analysis",
+                    "volume_analysis": "See detailed analysis",
+                    "support_analysis": "See detailed analysis",
+                    "resistance_analysis": "See detailed analysis",
+                    "chart_pattern": "See chart",
+                    "fvg_confluence": fvg_confluence_str,
+                    "social_verdict": "Analysis pending - see Social tab",
+                    "sentiment_score": "N/A",
+                    "sentiment_outlook": "See detailed analysis",
+                    "sentiment_drivers": "See detailed analysis",
+                    "news_summary": "See detailed analysis",
+                    "social_pulse": "See detailed analysis",
+                    "sentiment_risks": "See detailed analysis"
+                }
 
             # --- DISPLAY RESULTS ---
             st.divider()
@@ -636,7 +743,113 @@ if ticker_to_analyze:
             m3.metric("🐂 Bullish Signals", scan_results['bullish_count'])
             m4.metric("🐻 Bearish Signals", scan_results['bearish_count'])
             
-            t1, t2, t3, t4 = st.tabs(["🎯 FVG Scanner", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
+            t0, t1, t2, t3, t4 = st.tabs(["📊 Dashboard", "🎯 FVG Scanner", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
+            
+            with t0:
+                st.markdown("### 📊 Executive Dashboard")
+                st.caption(f"AI-Powered Summary for {ticker_to_analyze} ({company_name})")
+                
+                # --- FUNDAMENTALS SECTION ---
+                st.markdown("#### 🏛️ Fundamentals")
+                
+                fund_col1, fund_col2 = st.columns([3, 1])
+                with fund_col1:
+                    st.markdown(f"**Verdict:** {dashboard_data.get('fundamentals_verdict', 'N/A')}")
+                with fund_col2:
+                    rating = dashboard_data.get('fundamentals_rating', 'N/A')
+                    if isinstance(rating, (int, float)):
+                        color = "🟢" if rating >= 7 else "🟡" if rating >= 5 else "🔴"
+                        st.markdown(f"**Rating:** {color} {rating}/10")
+                    else:
+                        st.markdown(f"**Rating:** {rating}/10")
+                
+                f1, f2 = st.columns(2)
+                with f1:
+                    st.success(f"✅ **What's Great:** {dashboard_data.get('whats_great', 'N/A')}")
+                with f2:
+                    st.error(f"⚠️ **What's Not Great:** {dashboard_data.get('whats_not_great', 'N/A')}")
+                
+                f3, f4 = st.columns(2)
+                with f3:
+                    value_buy = dashboard_data.get('value_buy', 'N/A')
+                    if 'yes' in str(value_buy).lower():
+                        st.info(f"💰 **Value Buy:** {value_buy}")
+                    else:
+                        st.warning(f"💰 **Value Buy:** {value_buy}")
+                with f4:
+                    risk = dashboard_data.get('risk_level', 'Medium')
+                    risk_color = "🟢" if 'low' in str(risk).lower() else "🔴" if 'high' in str(risk).lower() else "🟡"
+                    st.markdown(f"**Risk Level:** {risk_color} {risk}")
+                
+                st.divider()
+                
+                # --- TECHNICALS SECTION ---
+                st.markdown("#### 🔭 Technicals")
+                
+                st.markdown(f"**Verdict:** {dashboard_data.get('technicals_verdict', 'N/A')}")
+                
+                tech_row1 = st.columns(3)
+                with tech_row1[0]:
+                    trend = dashboard_data.get('overall_trend', 'N/A')
+                    trend_icon = "📈" if 'bullish' in str(trend).lower() else "📉" if 'bearish' in str(trend).lower() else "➡️"
+                    st.markdown(f"**{trend_icon} Trend:** {trend}")
+                with tech_row1[1]:
+                    st.markdown(f"**📊 Volume:** {dashboard_data.get('volume_analysis', 'N/A')}")
+                with tech_row1[2]:
+                    st.markdown(f"**📐 Pattern:** {dashboard_data.get('chart_pattern', 'N/A')}")
+                
+                tech_row2 = st.columns(3)
+                with tech_row2[0]:
+                    st.markdown(f"**🟢 Support:** {dashboard_data.get('support_analysis', 'N/A')}")
+                with tech_row2[1]:
+                    st.markdown(f"**🔴 Resistance:** {dashboard_data.get('resistance_analysis', 'N/A')}")
+                with tech_row2[2]:
+                    fvg_conf = dashboard_data.get('fvg_confluence', fvg_confluence_str)
+                    if fvg_conf and fvg_conf != "None":
+                        st.success(f"**🎯 FVG Confluence:** {fvg_conf}")
+                    else:
+                        st.markdown(f"**🎯 FVG Confluence:** None")
+                
+                st.divider()
+                
+                # --- SENTIMENT SECTION ---
+                st.markdown("#### 💬 Sentiment")
+                
+                sent_col1, sent_col2 = st.columns([3, 1])
+                with sent_col1:
+                    st.markdown(f"**Verdict:** {dashboard_data.get('social_verdict', 'N/A')}")
+                with sent_col2:
+                    sent_score = dashboard_data.get('sentiment_score', 'N/A')
+                    if isinstance(sent_score, (int, float)):
+                        sent_color = "🟢" if sent_score >= 7 else "🟡" if sent_score >= 5 else "🔴"
+                        st.markdown(f"**Score:** {sent_color} {sent_score}/10")
+                    else:
+                        st.markdown(f"**Score:** {sent_score}/10")
+                
+                st.info(f"🎯 **Outlook:** {dashboard_data.get('sentiment_outlook', 'N/A')}")
+                
+                sent_row1 = st.columns(2)
+                with sent_row1[0]:
+                    st.markdown(f"**🔥 Key Drivers:** {dashboard_data.get('sentiment_drivers', 'N/A')}")
+                with sent_row1[1]:
+                    st.markdown(f"**📰 News:** {dashboard_data.get('news_summary', 'N/A')}")
+                
+                sent_row2 = st.columns(2)
+                with sent_row2[0]:
+                    st.markdown(f"**💬 Social Pulse:** {dashboard_data.get('social_pulse', 'N/A')}")
+                with sent_row2[1]:
+                    st.warning(f"**⚠️ Risks:** {dashboard_data.get('sentiment_risks', 'N/A')}")
+                
+                st.divider()
+                
+                # --- QUICK STATS ---
+                st.markdown("#### 📈 Quick Stats")
+                qs1, qs2, qs3, qs4, qs5 = st.columns(5)
+                qs1.metric("Price", f"${current_price:.2f}")
+                qs2.metric("P/E", f"{info.get('trailingPE', 'N/A')}")
+                qs3.metric("52W High", f"${info.get('fiftyTwoWeekHigh', 'N/A')}")
+                qs4.metric("52W Low", f"${info.get('fiftyTwoWeekLow', 'N/A')}")
+                qs5.metric("Analyst", f"{info.get('recommendationKey', 'N/A').upper() if info.get('recommendationKey') else 'N/A'}")
             
             with t1:
                 st.markdown("### 🎯 Multi-Timeframe FVG Analysis")
