@@ -3,6 +3,7 @@ import yfinance as yf
 import google.generativeai as genai
 from duckduckgo_search import DDGS
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import re
 import warnings
@@ -29,7 +30,6 @@ st.markdown("""
     .stButton>button:hover { background-color: #388bfd; }
     .status-pass { color: #2ea043; font-weight: bold; }
     .status-fail { color: #da3633; font-weight: bold; }
-    /* Improve input visibility */
     .stTextInput>div>div>input { color: #ffffff; background-color: #161b22; }
     </style>
     """, unsafe_allow_html=True)
@@ -38,7 +38,7 @@ st.markdown("""
 with st.sidebar:
     st.header("⚙️ Control Panel")
     
-    # API Key Handling (matching your CFA app pattern)
+    # API Key Handling
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("🔒 API Key Loaded Securely")
@@ -55,7 +55,7 @@ with st.sidebar:
     
     st.info("💡 **Ticker Guide:**\n- USA: `TSLA`, `AAPL`\n- India: `RELIANCE.NS`, `TCS.NS`\n- Canada: `SHOP.TO`, `RY.TO`")
 
-# --- GEMINI API SETUP (Matching your CFA app pattern) ---
+# --- GEMINI API SETUP ---
 model = None
 if api_key:
     try:
@@ -74,60 +74,324 @@ st.markdown("---")
 if 'search_results' not in st.session_state: st.session_state.search_results = []
 if 'selected_ticker' not in st.session_state: st.session_state.selected_ticker = None
 
-# --- FVG ENGINE (STRICT MATCH) ---
-class FVG_Engine:
-    @staticmethod
-    def resample_data(df, interval):
-        if df is None or df.empty: return None
-        logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-        try:
-            return df.resample(interval).agg(logic).dropna()
-        except Exception:
-            return None
 
+# ==========================================
+# MATH WIZ - EXACT COPY FROM WORKING SCANNER
+# ==========================================
+class MathWiz:
     @staticmethod
-    def find_bullish_fvgs(df, strict_mitigation=True):
-        fvgs = []
-        if df is None or len(df) < 3: return fvgs
-
-        for i in range(len(df) - 2):
-            c1 = df.iloc[i]
-            c2 = df.iloc[i+1] # Displacement
-            c3 = df.iloc[i+2]
+    def identify_strict_swings(df, neighbor_count=3):
+        """Identify swing highs and swing lows."""
+        is_swing_high = pd.Series(True, index=df.index)
+        is_swing_low = pd.Series(True, index=df.index)
+        
+        for i in range(1, neighbor_count + 1):
+            is_swing_high &= (df['High'] > df['High'].shift(i))
+            is_swing_low &= (df['Low'] < df['Low'].shift(i))
+            is_swing_high &= (df['High'] > df['High'].shift(-i))
+            is_swing_low &= (df['Low'] < df['Low'].shift(-i))
             
-            # Gap exists: C3 Low > C1 High
-            if c3['Low'] > c1['High'] and c2['Close'] > c2['Open']:
-                top = c3['Low']
-                bottom = c1['High']
-                avg_price = (top + bottom) / 2
-                is_valid = True
-                
-                if strict_mitigation:
-                    future_candles = df.iloc[i+3:]
-                    if not future_candles.empty:
-                        min_low = future_candles['Low'].min()
-                        if min_low <= top: is_valid = False # Mitigated
-                
-                if is_valid:
-                    fvgs.append({'date': df.index[i+1], 'top': top, 'bottom': bottom, 'avg': avg_price})
-        return fvgs
+        return is_swing_high, is_swing_low
 
     @staticmethod
-    def check_proximity(current_price, fvgs, threshold_pct):
-        matches = []
-        for fvg in fvgs:
-            dist_pct = abs(current_price - fvg['top']) / current_price
-            if dist_pct <= threshold_pct:
-                matches.append(fvg)
-        return matches
+    def find_fvg(df):
+        """Find Fair Value Gaps - EXACT LOGIC FROM SCANNER."""
+        bull_fvg = (df['Low'] > df['High'].shift(2))
+        bear_fvg = (df['High'] < df['Low'].shift(2))
+        return bull_fvg, bear_fvg
+    
+    @staticmethod
+    def check_ifvg_reversal(df):
+        """Check for Inverse FVG Reversal pattern."""
+        subset = df.iloc[-5:].copy().dropna()
+        if len(subset) < 5: return None
 
-# --- HELPER FUNCTIONS ---
+        c1 = subset.iloc[0]
+        c3 = subset.iloc[2]
+        c5 = subset.iloc[4]
+        
+        is_bear_fvg_first = c3['High'] < c1['Low']
+        is_bull_fvg_second = c5['Low'] > c3['High']
+        
+        if is_bear_fvg_first and is_bull_fvg_second:
+            return 'Bull'
+
+        is_bull_fvg_first = c3['Low'] > c1['High']
+        is_bear_fvg_second = c5['High'] < c3['Low']
+        
+        if is_bull_fvg_first and is_bear_fvg_second:
+            return 'Bear'
+            
+        return None
+
+    @staticmethod
+    def find_unmitigated_fvg_zone(df, threshold_pct=0.05):
+        """Check if price is near an unmitigated FVG zone - EXACT LOGIC FROM SCANNER."""
+        if len(df) < 5: return False, None
+        current_price = df['Close'].iloc[-1]
+        lookback = min(len(df), 50)
+        
+        for i in range(len(df)-1, max(len(df)-lookback, 2), -1):
+            curr_low = df['Low'].iloc[i]
+            prev_high = df['High'].iloc[i-2]
+            
+            # Bullish FVG: Current candle's low > candle 2 bars ago high
+            if curr_low > prev_high: 
+                gap_top = curr_low
+                gap_bottom = prev_high
+                
+                # Check if gap has been mitigated (price went below gap_bottom)
+                subsequent_data = df.iloc[i+1:]
+                if not subsequent_data.empty:
+                    if (subsequent_data['Low'] < gap_bottom).any():
+                        continue  # Gap was mitigated, skip
+                
+                # Check if current price is within threshold of gap bottom
+                upper_bound = gap_bottom * (1 + threshold_pct)
+                lower_bound = gap_bottom * (1 - threshold_pct)
+                if lower_bound <= current_price <= upper_bound:
+                    return True, {
+                        'date': df.index[i],
+                        'gap_top': gap_top,
+                        'gap_bottom': gap_bottom,
+                        'current_price': current_price
+                    }
+        return False, None
+
+    @staticmethod
+    def check_consecutive_candles(df, num_candles):
+        """Check for consecutive red or green candles."""
+        if len(df) < num_candles:
+            return None
+        
+        recent = df.iloc[-num_candles:]
+        all_red = all(recent['Close'] < recent['Open'])
+        all_green = all(recent['Close'] > recent['Open'])
+        
+        if all_red:
+            return 'Bull'  # Reversal candidate
+        elif all_green:
+            return 'Bear'  # Reversal candidate
+        
+        return None
+
+    @staticmethod
+    def calculate_choppiness(high, low, close, length=14):
+        """Calculate Choppiness Index."""
+        try:
+            tr1 = high - low
+            tr2 = (high - close.shift(1)).abs()
+            tr3 = (low - close.shift(1)).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            atr_sum = tr.rolling(window=length).sum()
+            high_max = high.rolling(window=length).max()
+            low_min = low.rolling(window=length).min()
+            
+            range_diff = high_max - low_min
+            range_diff.replace(0, np.nan, inplace=True)
+
+            numerator = np.log10(atr_sum / range_diff)
+            denominator = np.log10(length)
+            return 100 * (numerator / denominator)
+        except:
+            return pd.Series(dtype='float64')
+
+
+# ==========================================
+# DATA ENGINE - EXACT COPY FROM SCANNER
+# ==========================================
+def resample_custom(df, timeframe):
+    """Resample data to different timeframes - EXACT LOGIC FROM SCANNER."""
+    if df.empty: return df
+    agg_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+    try:
+        if timeframe == "1D": return df.resample("1D").agg(agg_dict).dropna()
+        if timeframe == "1W": return df.resample("W-FRI").agg(agg_dict).dropna()
+        if timeframe == "1M": return df.resample("ME").agg(agg_dict).dropna()
+
+        df_monthly = df.resample('MS').agg(agg_dict).dropna()
+        if timeframe == "3M": return df_monthly.resample('QE').agg(agg_dict).dropna()
+        if timeframe == "6M":
+            df_monthly['Year'] = df_monthly.index.year
+            df_monthly['Half'] = np.where(df_monthly.index.month <= 6, 1, 2)
+            df_6m = df_monthly.groupby(['Year', 'Half']).agg(agg_dict)
+            new_index = []
+            for (year, half) in df_6m.index:
+                month = 6 if half == 1 else 12
+                new_index.append(pd.Timestamp(year=year, month=month, day=30))
+            df_6m.index = pd.DatetimeIndex(new_index)
+            return df_6m.sort_index()
+        if timeframe == "12M": return df_monthly.resample('YE').agg(agg_dict).dropna()
+    except: return df
+    return df
+
+
+# ==========================================
+# ANALYSIS ENGINE - EXACT LOGIC FROM SCANNER
+# ==========================================
+def analyze_single_ticker(ticker, df_daily_raw, df_monthly_raw):
+    """Runs ALL scans for ONE ticker - EXACT LOGIC FROM SCANNER."""
+    results = {
+        'Ticker': ticker,
+        'Price': 0,
+        # Bullish signals
+        'Bull_OB_1D': False, 'Bull_OB_1W': False, 'Bull_OB_1M': False,
+        'Bull_FVG_1D': False, 'Bull_FVG_1W': False, 'Bull_FVG_1M': False,
+        'Bull_RevCand_1D': False, 'Bull_RevCand_1W': False, 'Bull_RevCand_1M': False,
+        'Bull_iFVG_1D': False, 'Bull_iFVG_1W': False, 'Bull_iFVG_1M': False,
+        'Support_3M': False, 'Support_6M': False, 'Support_12M': False,
+        'Squeeze_1D': False, 'Squeeze_1W': False,
+        # Bearish signals
+        'Bear_OB_1D': False, 'Bear_OB_1W': False, 'Bear_OB_1M': False,
+        'Bear_FVG_1D': False, 'Bear_FVG_1W': False, 'Bear_FVG_1M': False,
+        'Bear_RevCand_1D': False, 'Bear_RevCand_1W': False, 'Bear_RevCand_1M': False,
+        'Bear_iFVG_1D': False, 'Bear_iFVG_1W': False, 'Bear_iFVG_1M': False,
+        'Exhaustion': False,
+        # Confluence tracking
+        'support_zones': [],
+        'bullish_count': 0,
+        'bearish_count': 0
+    }
+    
+    try:
+        d_1d = resample_custom(df_daily_raw, "1D")
+        d_1w = resample_custom(df_daily_raw, "1W")
+        d_1m = resample_custom(df_monthly_raw, "1M")
+        d_3m = resample_custom(df_monthly_raw, "3M")
+        d_6m = resample_custom(df_monthly_raw, "6M")
+        d_12m = resample_custom(df_monthly_raw, "12M")
+        
+        data_map = {"1D": d_1d, "1W": d_1w, "1M": d_1m, "3M": d_3m, "6M": d_6m, "12M": d_12m}
+        
+        if not d_1d.empty:
+            results['Price'] = round(d_1d['Close'].iloc[-1], 2)
+        
+    except: 
+        return results
+
+    # --- SCAN EACH TIMEFRAME (1D, 1W, 1M) ---
+    for tf in ["1D", "1W", "1M"]:
+        if tf not in data_map or len(data_map[tf]) < 5: continue
+        
+        df = data_map[tf].copy() 
+        df['Bull_FVG'], df['Bear_FVG'] = MathWiz.find_fvg(df)
+        df['Is_Swing_High'], df['Is_Swing_Low'] = MathWiz.identify_strict_swings(df)
+        
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # --- BULLISH FVG + Swing Break ---
+        if curr['Bull_FVG']:
+            past_swings = df[df['Is_Swing_High']]
+            if not past_swings.empty:
+                last_swing_high = past_swings['High'].iloc[-1]
+                if curr['Close'] > last_swing_high and prev['Close'] <= last_swing_high:
+                    results[f'Bull_FVG_{tf}'] = True
+
+        # --- BEARISH FVG + Swing Break ---
+        if curr['Bear_FVG']:
+            past_swings = df[df['Is_Swing_Low']]
+            if not past_swings.empty:
+                last_swing_low = past_swings['Low'].iloc[-1]
+                if curr['Close'] < last_swing_low and prev['Close'] >= last_swing_low:
+                    results[f'Bear_FVG_{tf}'] = True
+
+        # --- BULLISH ORDER BLOCK: 1 bearish + 3 bullish + FVG ---
+        subset = df.iloc[-4:].copy()
+        if len(subset) == 4:
+            c1, c2, c3, c4 = subset.iloc[0], subset.iloc[1], subset.iloc[2], subset.iloc[3]
+            c1_bearish = c1['Close'] < c1['Open']
+            c2_bullish = c2['Close'] > c2['Open']
+            c3_bullish = c3['Close'] > c3['Open']
+            c4_bullish = c4['Close'] > c4['Open']
+            c4_has_bull_fvg = c4['Low'] > c2['High']
+            
+            if c1_bearish and c2_bullish and c3_bullish and c4_bullish and c4_has_bull_fvg:
+                results[f'Bull_OB_{tf}'] = True
+
+        # --- BEARISH ORDER BLOCK: 1 bullish + 3 bearish + FVG ---
+        if len(subset) == 4:
+            c1_bullish = c1['Close'] > c1['Open']
+            c2_bearish = c2['Close'] < c2['Open']
+            c3_bearish = c3['Close'] < c3['Open']
+            c4_bearish = c4['Close'] < c4['Open']
+            c4_has_bear_fvg = c4['High'] < c2['Low']
+            
+            if c1_bullish and c2_bearish and c3_bearish and c4_bearish and c4_has_bear_fvg:
+                results[f'Bear_OB_{tf}'] = True
+        
+        # --- iFVG Reversal ---
+        ifvg_status = MathWiz.check_ifvg_reversal(df)
+        if ifvg_status == "Bull":
+            results[f'Bull_iFVG_{tf}'] = True
+        elif ifvg_status == "Bear":
+            results[f'Bear_iFVG_{tf}'] = True
+
+    # --- SUPPORT ZONES (Higher TFs: 3M, 6M, 12M) ---
+    support_zones = []
+    for tf_name, tf_df in [("3M", d_3m), ("6M", d_6m), ("12M", d_12m)]:
+        found, zone_data = MathWiz.find_unmitigated_fvg_zone(tf_df)
+        if found:
+            results[f'Support_{tf_name}'] = True
+            support_zones.append({'timeframe': tf_name, 'zone': zone_data})
+    
+    results['support_zones'] = support_zones
+
+    # --- SQUEEZE (Choppiness > 59) ---
+    if not d_1d.empty:
+        chop_series_d = MathWiz.calculate_choppiness(d_1d['High'], d_1d['Low'], d_1d['Close'])
+        if not chop_series_d.empty and not pd.isna(chop_series_d.iloc[-1]):
+            if chop_series_d.iloc[-1] > 59:
+                results['Squeeze_1D'] = True
+                
+    if not d_1w.empty:
+        chop_series_w = MathWiz.calculate_choppiness(d_1w['High'], d_1w['Low'], d_1w['Close'])
+        if not chop_series_w.empty and not pd.isna(chop_series_w.iloc[-1]):
+            if chop_series_w.iloc[-1] > 59:
+                results['Squeeze_1W'] = True
+
+    # --- EXHAUSTION (Choppiness < 25 on Weekly) ---
+    if not d_1w.empty:
+        chop_series = MathWiz.calculate_choppiness(d_1w['High'], d_1w['Low'], d_1w['Close'])
+        if not chop_series.empty and not pd.isna(chop_series.iloc[-1]):
+            if chop_series.iloc[-1] < 25:
+                results['Exhaustion'] = True
+
+    # --- REVERSAL CANDIDATES (Consecutive Candles) ---
+    if not d_1d.empty and len(d_1d) >= 5:
+        rev = MathWiz.check_consecutive_candles(d_1d, 5)
+        if rev == 'Bull': results['Bull_RevCand_1D'] = True
+        elif rev == 'Bear': results['Bear_RevCand_1D'] = True
+    
+    if not d_1w.empty and len(d_1w) >= 4:
+        rev = MathWiz.check_consecutive_candles(d_1w, 4)
+        if rev == 'Bull': results['Bull_RevCand_1W'] = True
+        elif rev == 'Bear': results['Bear_RevCand_1W'] = True
+    
+    if not d_1m.empty and len(d_1m) >= 3:
+        rev = MathWiz.check_consecutive_candles(d_1m, 3)
+        if rev == 'Bull': results['Bull_RevCand_1M'] = True
+        elif rev == 'Bear': results['Bear_RevCand_1M'] = True
+
+    # --- COUNT SIGNALS ---
+    bull_keys = [k for k in results.keys() if k.startswith('Bull_') or k.startswith('Support_') or k.startswith('Squeeze_')]
+    bear_keys = [k for k in results.keys() if k.startswith('Bear_') or k == 'Exhaustion']
+    
+    results['bullish_count'] = sum(1 for k in bull_keys if results.get(k, False))
+    results['bearish_count'] = sum(1 for k in bear_keys if results.get(k, False))
+
+    return results
+
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 def search_tickers_safe(query, country):
     """Searches using DuckDuckGo with Ratelimit Handling."""
     candidates = []
     search_term = f"site:finance.yahoo.com/quote {query} {country} stock"
     try:
-        # Sleep briefly to avoid hammering the API if user clicks fast
         time.sleep(1) 
         with DDGS() as ddgs:
             results = list(ddgs.text(search_term, max_results=4))
@@ -145,7 +409,7 @@ def search_tickers_safe(query, country):
     return candidates
 
 def get_gemini_response(prompt):
-    """Generate content using the global model instance (matching CFA app pattern)."""
+    """Generate content using the global model instance."""
     if model is None:
         return "**Error:** Model not initialized. Please provide API key."
     try:
@@ -160,47 +424,19 @@ def fetch_financial_data(ticker_symbol):
         info = stock.info
     except:
         info = {}
-    history_daily = stock.history(period="1y", interval="1d")
+    history_daily = stock.history(period="2y", interval="1d")
+    history_monthly = stock.history(period="max", interval="1mo")
     if history_daily.empty:
-        return None, None, None, None, None, None
-    return stock, info, None, None, None, history_daily
-
-def get_multi_tf_data(ticker_symbol):
-    stock = yf.Ticker(ticker_symbol)
-    df_1h = stock.history(period="730d", interval="1h") 
-    df_1d = stock.history(period="5y", interval="1d")   
-    df_1mo = stock.history(period="max", interval="1mo") 
-
-    data_map = {}
-    if not df_1h.empty:
-        data_map['1H'] = df_1h
-        data_map['4H'] = FVG_Engine.resample_data(df_1h, '4h')
-    if not df_1d.empty:
-        data_map['1D'] = df_1d
-        data_map['1W'] = FVG_Engine.resample_data(df_1d, 'W-FRI') 
-    if not df_1mo.empty:
-        data_map['1M'] = df_1mo
-        data_map['3M'] = FVG_Engine.resample_data(df_1mo, '3ME')  
-        data_map['6M'] = FVG_Engine.resample_data(df_1mo, '6ME')  
-        data_map['12M'] = FVG_Engine.resample_data(df_1mo, '12ME') 
-    return data_map
+        return None, None, None, None
+    return stock, info, history_daily, history_monthly
 
 def get_social_sentiment_data(ticker, company_name=""):
     """Fetches news and social mentions for sentiment analysis."""
     all_data = []
     
-    # Search queries to try
-    search_queries = [
-        f"{ticker} stock news",
-        f"{ticker} stock reddit",
-        f"{ticker} stock sentiment",
-        f"{company_name} stock analysis" if company_name else f"{ticker} investor sentiment"
-    ]
-    
     try:
-        time.sleep(0.5)  # Rate limit protection
+        time.sleep(0.5)
         with DDGS() as ddgs:
-            # Get recent news
             try:
                 news = list(ddgs.news(f"{ticker} stock", timelimit="w", max_results=5))
                 for n in news:
@@ -214,7 +450,6 @@ def get_social_sentiment_data(ticker, company_name=""):
             except:
                 pass
             
-            # Get Reddit/forum discussions
             try:
                 time.sleep(0.3)
                 reddit_results = list(ddgs.text(f"{ticker} stock reddit discussion", max_results=3))
@@ -229,7 +464,6 @@ def get_social_sentiment_data(ticker, company_name=""):
             except:
                 pass
             
-            # Get Twitter/X mentions
             try:
                 time.sleep(0.3)
                 twitter_results = list(ddgs.text(f"{ticker} stock twitter OR x.com", max_results=3))
@@ -244,7 +478,6 @@ def get_social_sentiment_data(ticker, company_name=""):
             except:
                 pass
                 
-            # Get general sentiment articles
             try:
                 time.sleep(0.3)
                 general = list(ddgs.text(f"{ticker} stock buy sell hold analyst", max_results=3))
@@ -263,14 +496,15 @@ def get_social_sentiment_data(ticker, company_name=""):
     
     return all_data
 
-# --- REDESIGNED WORKFLOW ---
 
+# ==========================================
+# UI WORKFLOW
+# ==========================================
 st.markdown("### 1️⃣ Identify Target")
 
 col_mode, col_input = st.columns([1, 3])
 
 with col_mode:
-    # Toggle between Search and Direct Input
     input_mode = st.radio("Input Method:", ["Search by Name", "Direct Ticker Input"])
 
 ticker_to_analyze = None
@@ -281,7 +515,7 @@ with col_input:
         with c_search_1:
             search_query = st.text_input("Company Name", placeholder="e.g. Tesla, Reliance...")
         with c_search_2:
-            st.write("") # Spacer
+            st.write("")
             st.write("") 
             if st.button("🔎 Find", use_container_width=True):
                 if search_query:
@@ -289,7 +523,6 @@ with col_input:
                         results = search_tickers_safe(search_query, selected_country)
                         st.session_state.search_results = results
         
-        # Display Search Results
         if st.session_state.search_results:
             options = [f"{item['symbol']} | {item['title']}" for item in st.session_state.search_results]
             selected_option = st.selectbox("Select Correct Stock:", options)
@@ -298,7 +531,7 @@ with col_input:
         elif search_query and not st.session_state.search_results:
              st.warning("Search returned no results or was blocked. Please switch to 'Direct Ticker Input'.")
              
-    else: # Direct Input Mode
+    else:
         direct_input = st.text_input("Enter Exact Ticker Symbol", placeholder="e.g. TSLA, RELIANCE.NS, SHOP.TO")
         if direct_input:
             ticker_to_analyze = direct_input.strip().upper()
@@ -317,44 +550,20 @@ if ticker_to_analyze:
             st.error("⚠️ Model not initialized. Check your API key.")
             st.stop()
             
-        with st.spinner(f"Running Multi-Timeframe FVG Scan & AI Analysis on {ticker_to_analyze}..."):
+        with st.spinner(f"Running Multi-Timeframe Analysis on {ticker_to_analyze}..."):
             
             # 1. Fetch Data
-            stock, info, bs, inc, cf, history = fetch_financial_data(ticker_to_analyze)
-            if history is None:
+            stock, info, history_daily, history_monthly = fetch_financial_data(ticker_to_analyze)
+            if history_daily is None:
                 st.error(f"❌ Could not load data for {ticker_to_analyze}. Check if ticker is correct for Region: {selected_country}.")
                 st.stop()
             
-            current_price = history['Close'].iloc[-1]
+            current_price = history_daily['Close'].iloc[-1]
             
-            # 2. FVG Scan
-            tf_data = get_multi_tf_data(ticker_to_analyze)
-            scan_pairs = [
-                ("1H & 4H", "1H", "4H", 0.01, 0.01),
-                ("1D & 1W", "1D", "1W", 0.02, 0.02),
-                ("1W & 1M", "1W", "1M", 0.02, 0.03),
-                ("1M & 3M", "1M", "3M", 0.03, 0.04),
-                ("3M & 6M", "3M", "6M", 0.04, 0.05),
-                ("6M & 12M", "6M", "12M", 0.05, 0.05),
-            ]
-            
-            fvg_results = []
-            for pair_name, tf1_name, tf2_name, prox1, prox2 in scan_pairs:
-                if tf1_name in tf_data and tf2_name in tf_data and tf_data[tf1_name] is not None:
-                    fvgs_1 = FVG_Engine.find_bullish_fvgs(tf_data[tf1_name])
-                    fvgs_2 = FVG_Engine.find_bullish_fvgs(tf_data[tf2_name])
-                    valid_1 = FVG_Engine.check_proximity(current_price, fvgs_1, prox1)
-                    valid_2 = FVG_Engine.check_proximity(current_price, fvgs_2, prox2)
-                    
-                    if valid_1 and valid_2:
-                        fvg_results.append({
-                            "pair": pair_name,
-                            "status": "CONFLUENCE DETECTED",
-                            "details": f"Price within limits ({prox1*100}% & {prox2*100}%) of Unmitigated Bullish FVGs.",
-                            "zones": (valid_1, valid_2)
-                        })
+            # 2. Run Full Analysis (EXACT SCANNER LOGIC)
+            scan_results = analyze_single_ticker(ticker_to_analyze, history_daily, history_monthly)
 
-            # 3. AI Analysis (using global model like CFA app)
+            # 3. AI Analysis
             fund_prompt = f"""
             Analyze {ticker_to_analyze} (Price: {current_price}) Metrics:
             - Market Cap: {info.get('marketCap', 'N/A')}
@@ -367,16 +576,14 @@ if ticker_to_analyze:
             """
             tech_prompt = f"""
             Analyze Technicals {ticker_to_analyze} (Price: {current_price}).
-            Last 30 Days OHLCV: {history.tail(30).to_csv()}
+            Last 30 Days OHLCV: {history_daily.tail(30).to_csv()}
             Apply: Murphy, Wyckoff, Nison, Brooks.
             Verdict: Bullish/Bearish/Neutral?
             """
             
-            # Fetch social/news data
             company_name = info.get('shortName', '') or info.get('longName', '')
             social_data = get_social_sentiment_data(ticker_to_analyze, company_name)
             
-            # Build comprehensive social prompt
             if social_data:
                 social_context = "\n".join([
                     f"[{item['type']}] {item['title']} - {item.get('body', '')}" 
@@ -414,7 +621,7 @@ if ticker_to_analyze:
             ## 🎯 Sentiment-Based Outlook
             [1-2 sentence actionable insight based on sentiment]
             
-            Be specific, data-driven, and avoid generic statements. If data is limited, clearly state that and provide what analysis you can.
+            Be specific, data-driven, and avoid generic statements.
             """
             
             fund_an = get_gemini_response(fund_prompt)
@@ -423,36 +630,109 @@ if ticker_to_analyze:
 
             # --- DISPLAY RESULTS ---
             st.divider()
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Current Price", f"{current_price:.2f} {info.get('currency', '')}")
             m2.metric("P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
-            m3.metric("Rec Key", f"{info.get('recommendationKey', 'N/A')}")
+            m3.metric("🐂 Bullish Signals", scan_results['bullish_count'])
+            m4.metric("🐻 Bearish Signals", scan_results['bearish_count'])
             
-            t1, t2, t3, t4 = st.tabs(["🎯 FVG Sniper", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
+            t1, t2, t3, t4 = st.tabs(["🎯 FVG Scanner", "🏛️ Fundamentals", "🔭 Technicals", "💬 Social"])
             
             with t1:
-                st.markdown("### 🎯 FVG Confluence")
-                st.info("Filters: Bullish Only | Unmitigated (Strict) | Dual Timeframe Proximity")
-                if fvg_results:
-                    for res in fvg_results:
-                        with st.expander(f"✅ {res['pair']} - CONFLUENCE FOUND", expanded=True):
-                            st.write(res['details'])
-                            c_z1, c_z2 = st.columns(2)
-                            with c_z1: st.json(res['zones'][0])
-                            with c_z2: st.json(res['zones'][1])
+                st.markdown("### 🎯 Multi-Timeframe FVG Analysis")
+                st.caption("Using exact logic from Prath's Market Scanner")
+                
+                # --- BULLISH SIGNALS TABLE ---
+                st.markdown("#### 🐂 Bullish Signals")
+                
+                bull_data = []
+                for tf in ['1D', '1W', '1M']:
+                    row = {
+                        'Timeframe': tf,
+                        'Order Block': '✅' if scan_results.get(f'Bull_OB_{tf}') else '❌',
+                        'FVG + Swing Break': '✅' if scan_results.get(f'Bull_FVG_{tf}') else '❌',
+                        'Reversal Cand': '✅' if scan_results.get(f'Bull_RevCand_{tf}') else '❌',
+                        'iFVG': '✅' if scan_results.get(f'Bull_iFVG_{tf}') else '❌',
+                    }
+                    bull_data.append(row)
+                
+                bull_df = pd.DataFrame(bull_data)
+                st.dataframe(bull_df, hide_index=True, use_container_width=True)
+                
+                # --- SUPPORT ZONES (HTF Confluence) ---
+                st.markdown("#### 🏔️ Support Zones (Higher Timeframe Confluence)")
+                
+                support_found = []
+                for tf in ['3M', '6M', '12M']:
+                    if scan_results.get(f'Support_{tf}'):
+                        support_found.append(tf)
+                
+                if len(support_found) >= 2:
+                    st.success(f"✅ **CONFLUENCE DETECTED** - Price near unmitigated FVG zones on: {', '.join(support_found)}")
+                    if scan_results['support_zones']:
+                        with st.expander("View Zone Details", expanded=True):
+                            for zone in scan_results['support_zones']:
+                                st.json(zone)
+                elif len(support_found) == 1:
+                    st.warning(f"⚠️ Single timeframe support on {support_found[0]} - Not confluence (need 2+ TFs)")
                 else:
-                    st.error("❌ No Confluence Found matching Strict Criteria.")
+                    st.info("❌ No higher timeframe support zones detected")
+                
+                # --- SQUEEZE ---
+                st.markdown("#### 🔄 Squeeze Status (Choppiness > 59)")
+                squeeze_col1, squeeze_col2 = st.columns(2)
+                with squeeze_col1:
+                    if scan_results.get('Squeeze_1D'):
+                        st.success("✅ Daily Squeeze Active")
+                    else:
+                        st.info("❌ No Daily Squeeze")
+                with squeeze_col2:
+                    if scan_results.get('Squeeze_1W'):
+                        st.success("✅ Weekly Squeeze Active")
+                    else:
+                        st.info("❌ No Weekly Squeeze")
+                
+                st.divider()
+                
+                # --- BEARISH SIGNALS TABLE ---
+                st.markdown("#### 🐻 Bearish Signals")
+                
+                bear_data = []
+                for tf in ['1D', '1W', '1M']:
+                    row = {
+                        'Timeframe': tf,
+                        'Order Block': '✅' if scan_results.get(f'Bear_OB_{tf}') else '❌',
+                        'FVG + Swing Break': '✅' if scan_results.get(f'Bear_FVG_{tf}') else '❌',
+                        'Reversal Cand': '✅' if scan_results.get(f'Bear_RevCand_{tf}') else '❌',
+                        'iFVG': '✅' if scan_results.get(f'Bear_iFVG_{tf}') else '❌',
+                    }
+                    bear_data.append(row)
+                
+                bear_df = pd.DataFrame(bear_data)
+                st.dataframe(bear_df, hide_index=True, use_container_width=True)
+                
+                # --- EXHAUSTION ---
+                if scan_results.get('Exhaustion'):
+                    st.error("⚠️ **EXHAUSTION DETECTED** - Weekly Choppiness < 25 (Trend may reverse)")
             
-            with t2: st.markdown(fund_an)
+            with t2: 
+                st.markdown(fund_an)
+            
             with t3:
-                fig = go.Figure(data=[go.Candlestick(x=history.index, open=history['Open'], high=history['High'], low=history['Low'], close=history['Close'])])
+                fig = go.Figure(data=[go.Candlestick(
+                    x=history_daily.index, 
+                    open=history_daily['Open'], 
+                    high=history_daily['High'], 
+                    low=history_daily['Low'], 
+                    close=history_daily['Close']
+                )])
                 fig.update_layout(template="plotly_dark", height=400, xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
                 st.markdown(tech_an)
+            
             with t4: 
                 st.markdown(soc_an)
                 
-                # Show source data in an expander
                 if social_data:
                     st.markdown("---")
                     with st.expander("📚 View Raw Data Sources", expanded=False):
