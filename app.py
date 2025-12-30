@@ -1,6 +1,6 @@
 import streamlit as st
 import yfinance as yf
-from yahooquery import Ticker as YQTicker  # FASTER FUNDAMENTALS
+from yahooquery import Ticker as YQTicker
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -337,7 +337,7 @@ def fetch_financial_data(ticker_symbol):
                     'currency': get_val('financialData', 'financialCurrency'),
                     'sector': get_val('assetProfile', 'sector'),
                     'industry': get_val('assetProfile', 'industry'),
-                    'longName': get_val('quoteType', 'longName'), # Might need quoteType module
+                    'longName': get_val('quoteType', 'longName'),
                     'trailingPE': get_val('summaryDetail', 'trailingPE'),
                     'pegRatio': get_val('defaultKeyStatistics', 'pegRatio'),
                     'priceToBook': get_val('defaultKeyStatistics', 'priceToBook'),
@@ -362,8 +362,7 @@ def fetch_financial_data(ticker_symbol):
                 except: pass
                 
     except Exception as e:
-        print(f"YahooQuery Failed: {e}")
-        # Fallback to empty info, chart will still load
+        # Fallback to empty info if yahooquery fails
         pass
 
     # Calculate Returns for Grading
@@ -520,9 +519,10 @@ if ticker_to_analyze:
                 # Reuse the nice Card UI from previous turn
                 def render_card(pair, data, mode):
                     css = "bullish" if mode=="bullish" else "bearish"
+                    # KEY FIX: Match the dictionary keys from the analyze function (tf1, tf2)
                     st.markdown(f"""<div class="fvg-card {css}">
                         <div class="fvg-header">{pair}</div>
-                        <div>{data['tf1_zone']['status']} | {data['tf2_zone']['status']}</div>
+                        <div>{data['tf1']['status']} | {data['tf2']['status']}</div>
                     </div>""", unsafe_allow_html=True)
                 
                 if fvg_results['bullish_confluence']:
