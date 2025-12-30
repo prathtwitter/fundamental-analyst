@@ -4,3 +4,4 @@ google-generativeai
 duckduckgo-search==6.4.2
 pandas
 plotly
+pip install yahooquery

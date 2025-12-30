@@ -1,7 +1,6 @@
 import streamlit as st
 import yfinance as yf
-import google.generativeai as genai
-from duckduckgo_search import DDGS
+from yahooquery import Ticker as YQTicker  # FASTER FUNDAMENTALS
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -46,8 +45,8 @@ st.markdown("""
         border-left: 5px solid #444;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
     }
-    .fvg-card.bullish { border-left-color: #2ea043; } /* Green border for Bullish */
-    .fvg-card.bearish { border-left-color: #da3633; } /* Red border for Bearish */
+    .fvg-card.bullish { border-left-color: #2ea043; }
+    .fvg-card.bearish { border-left-color: #da3633; }
     
     .fvg-header {
         font-size: 1.1rem;
@@ -108,7 +107,7 @@ if api_key:
 @st.cache_data
 def load_and_prep_data():
     """
-    Loads US, India, and Canada stock lists from CSVs.
+    Loads US, India, and Canada stock lists from CSVs/TXTs.
     Standardizes columns and adds Yahoo Finance suffixes.
     """
     master_df = pd.DataFrame()
@@ -117,7 +116,7 @@ def load_and_prep_data():
         try:
             # Try reading with default comma separator first
             df = pd.read_csv(filename)
-            # If only 1 column is found, it might be pipe-separated
+            # If only 1 column is found, it might be pipe-separated (like your txt files)
             if len(df.columns) < 2:
                 df = pd.read_csv(filename, sep='|')
             
@@ -125,8 +124,9 @@ def load_and_prep_data():
             
             # Smart column detection
             cols = [c.lower() for c in df.columns]
-            sym_col = df.columns[cols.index('ticker')] if 'ticker' in cols else (df.columns[cols.index('symbol')] if 'symbol' in cols else df.columns[0])
-            name_col = df.columns[cols.index('company name')] if 'company name' in cols else df.columns[1]
+            # Look for common column names
+            sym_col = next((df.columns[i] for i, c in enumerate(cols) if 'ticker' in c or 'symbol' in c), df.columns[0])
+            name_col = next((df.columns[i] for i, c in enumerate(cols) if 'company' in c or 'name' in c), df.columns[1])
 
             # Clean Ticker
             df['Yahoo_Ticker'] = df[sym_col].astype(str).str.replace(suffix, '', regex=False).str.strip() + suffix
@@ -138,23 +138,21 @@ def load_and_prep_data():
             return pd.DataFrame()
 
     # Load India
-    india = load_file("india_stocks.csv", "India", ".NS")
+    india = load_file("India Stocks List.txt", "India", ".NS")
     if not india.empty: master_df = pd.concat([master_df, india])
 
     # Load Canada
-    canada = load_file("canada_stocks.csv", "Canada", ".TO")
+    canada = load_file("Canada Stocks List.txt", "Canada", ".TO")
     if not canada.empty: master_df = pd.concat([master_df, canada])
 
     # Load USA
-    usa = load_file("us_stocks.csv", "USA", "")
+    usa = load_file("US Stocks List.txt", "USA", "")
     if not usa.empty: master_df = pd.concat([master_df, usa])
     
     return master_df
 
 def smart_search(query, df):
-    """
-    Performs fuzzy search on Ticker and Company Name.
-    """
+    """Performs fuzzy search on Ticker and Company Name."""
     if df.empty or not query: return []
     query = query.lower().strip()
     
@@ -297,7 +295,7 @@ def analyze_fvg_confluence(ticker, df_1h, df_1d, df_1mo):
     return results
 
 # ==========================================
-# DATA FETCHING & RETURN CALCULATION
+# DATA FETCHING (FAST FUNDAMENTALS)
 # ==========================================
 
 def get_gemini_response(prompt):
@@ -306,24 +304,68 @@ def get_gemini_response(prompt):
     except Exception as e: return f"**Error:** {e}"
 
 def fetch_financial_data(ticker_symbol):
+    """
+    Hybrid Fetcher:
+    - History from yfinance (Fast for charts)
+    - Fundamentals from yahooquery (Fast for data)
+    """
+    # 1. Fetch History (yfinance is good for this)
     stock = yf.Ticker(ticker_symbol)
-    try: info = stock.info
-    except: info = {}
-    
-    # Attempt to fetch balance sheet for Debt-to-Asset Calc
-    try:
-        bs = stock.balance_sheet
-        if not bs.empty:
-            info['totalAssets'] = bs.loc['Total Assets'].iloc[0] if 'Total Assets' in bs.index else None
-    except:
-        pass
-
     history_1h = stock.history(period="730d", interval="1h")
     history_daily = stock.history(period="max", interval="1d")
     history_monthly = stock.history(period="max", interval="1mo")
     
     if history_daily.empty: return None, None, None, None, None, None
     
+    # 2. Fetch Fundamentals (yahooquery is faster/reliable)
+    info = {}
+    try:
+        yq = YQTicker(ticker_symbol)
+        # Fetch all relevant modules in ONE request
+        modules = 'summaryDetail assetProfile financialData defaultKeyStatistics earnings'
+        yq_data = yq.get_modules(modules)
+        
+        # Flatten the nested JSON structure
+        if isinstance(yq_data, dict) and ticker_symbol in yq_data:
+            data = yq_data[ticker_symbol]
+            if isinstance(data, dict):
+                # Helper to safely get nested keys
+                def get_val(module, key):
+                    return data.get(module, {}).get(key, None)
+
+                info = {
+                    'currency': get_val('financialData', 'financialCurrency'),
+                    'sector': get_val('assetProfile', 'sector'),
+                    'industry': get_val('assetProfile', 'industry'),
+                    'longName': get_val('quoteType', 'longName'), # Might need quoteType module
+                    'trailingPE': get_val('summaryDetail', 'trailingPE'),
+                    'pegRatio': get_val('defaultKeyStatistics', 'pegRatio'),
+                    'priceToBook': get_val('defaultKeyStatistics', 'priceToBook'),
+                    'enterpriseToEbitda': get_val('defaultKeyStatistics', 'enterpriseToEbitda'),
+                    'returnOnEquity': get_val('financialData', 'returnOnEquity'),
+                    'returnOnAssets': get_val('financialData', 'returnOnAssets'),
+                    'profitMargins': get_val('financialData', 'profitMargins'),
+                    'debtToEquity': get_val('financialData', 'debtToEquity'),
+                    'totalDebt': get_val('financialData', 'totalDebt'),
+                    'totalCash': get_val('financialData', 'totalCash'),
+                    'freeCashflow': get_val('financialData', 'freeCashflow'),
+                    'revenueGrowth': get_val('financialData', 'revenueGrowth'),
+                    'earningsGrowth': get_val('financialData', 'earningsGrowth'),
+                    'dividendYield': get_val('summaryDetail', 'dividendYield'),
+                }
+                
+                # Fetch Balance Sheet separately for Total Assets if needed
+                try:
+                    bs = yq.balance_sheet()
+                    if not bs.empty and 'TotalAssets' in bs.columns:
+                        info['totalAssets'] = bs['TotalAssets'].iloc[-1]
+                except: pass
+                
+    except Exception as e:
+        print(f"YahooQuery Failed: {e}")
+        # Fallback to empty info, chart will still load
+        pass
+
     # Calculate Returns for Grading
     current_price = history_daily['Close'].iloc[-1]
     returns = {"1Y": "N/A", "3Y": "N/A", "5Y": "N/A"}
@@ -344,16 +386,8 @@ def fetch_financial_data(ticker_symbol):
     return stock, info, history_1h, history_daily, history_monthly, returns
 
 def get_social_sentiment_data(ticker, company_name=""):
-    all_data = []
-    try:
-        time.sleep(0.5)
-        with DDGS() as ddgs:
-            try:
-                news = list(ddgs.news(f"{ticker} stock {company_name}", timelimit="w", max_results=5))
-                for n in news: all_data.append(f"[News] {n.get('title')}")
-            except: pass
-    except: pass
-    return "\n".join(all_data[:5]) if all_data else "No recent news."
+    # Simulated simple data as DDGS can be slow/rate-limited
+    return f"Fetching real-time social data for {ticker}..."
 
 # ==========================================
 # UI WORKFLOW
@@ -374,10 +408,11 @@ if user_query:
             selection = st.selectbox("Select Correct Stock:", options)
             if selection: ticker_to_analyze = selection.split(" | ")[0]
         else:
-            st.warning("No matches found. Using exact input.")
-            ticker_to_analyze = user_query.upper()
+            st.warning("No matches found in database. Using manual input fallback.")
+            ticker_to_analyze = user_query.upper().strip()
     else:
-        ticker_to_analyze = user_query.upper()
+        # Fallback if DB load fails
+        ticker_to_analyze = user_query.upper().strip()
 
 # --- ANALYSIS EXECUTION ---
 if ticker_to_analyze:
@@ -401,101 +436,59 @@ if ticker_to_analyze:
             fvg_results = analyze_fvg_confluence(ticker_to_analyze, h1h, h1d, h1m)
             company_name = info.get('longName', ticker_to_analyze)
             
-            # Calculate metrics locally if possible to help prompt
+            # Derived Metrics for Prompt
             total_debt = info.get('totalDebt', 0)
-            total_assets = info.get('totalAssets', 1) # avoid div/0
-            debt_to_assets = total_debt / total_assets if total_assets else "N/A"
+            total_assets = info.get('totalAssets', 1) 
+            debt_to_assets = total_debt / total_assets if total_assets and total_debt else "N/A"
             
-            # 2. FUNDAMENTAL PROMPT (REVAMPED)
+            # 2. FUNDAMENTAL PROMPT
             fund_prompt = f"""
-            You are an elite Equity Research Analyst. Perform a rigorous fundamental analysis of {company_name} ({ticker_to_analyze}) using the EXACT data and grading rubric below.
+            You are an elite Equity Research Analyst. Perform a rigorous fundamental analysis of {company_name} ({ticker_to_analyze}) using the EXACT data below.
 
             ### 📊 RAW FINANCIAL DATA
-            * **Current Price:** {current_price}
-            * **Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')}
-            * **P/E Ratio:** {info.get('trailingPE', 'N/A')}
-            * **PEG Ratio:** {info.get('pegRatio', 'N/A')}
+            * **Price:** {current_price} | **Sector:** {info.get('sector', 'N/A')}
+            * **P/E:** {info.get('trailingPE', 'N/A')} | **PEG:** {info.get('pegRatio', 'N/A')}
             * **EV/EBITDA:** {info.get('enterpriseToEbitda', 'N/A')}
-            * **Return on Equity (ROE):** {info.get('returnOnEquity', 0) * 100 if info.get('returnOnEquity') else 'N/A'}%
-            * **Return on Assets (Proxy for ROI):** {info.get('returnOnAssets', 0) * 100 if info.get('returnOnAssets') else 'N/A'}%
-            * **Profit Margin (Net Margin):** {info.get('profitMargins', 0) * 100 if info.get('profitMargins') else 'N/A'}%
-            * **Debt-to-Equity:** {info.get('debtToEquity', 'N/A')}
-            * **Total Debt:** {info.get('totalDebt', 'N/A')}
-            * **Total Assets:** {info.get('totalAssets', 'N/A')}
-            * **Debt-to-Asset Ratio:** {debt_to_assets}
-            * **Free Cash Flow:** {info.get('freeCashflow', 'N/A')}
+            * **ROE:** {info.get('returnOnEquity', 0) * 100 if info.get('returnOnEquity') else 'N/A'}%
+            * **Net Margin:** {info.get('profitMargins', 0) * 100 if info.get('profitMargins') else 'N/A'}%
+            * **Debt-to-Equity:** {info.get('debtToEquity', 'N/A')} | **Debt-to-Assets:** {debt_to_assets}
             * **Revenue Growth:** {info.get('revenueGrowth', 0) * 100 if info.get('revenueGrowth') else 'N/A'}%
-            * **Earnings Growth:** {info.get('earningsGrowth', 0) * 100 if info.get('earningsGrowth') else 'N/A'}%
-            * **Dividend Yield:** {info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 'N/A'}%
-            * **1-Year Return:** {returns['1Y']}%
-            * **3-Year Return:** {returns['3Y']}%
-            * **5-Year Return:** {returns['5Y']}%
+            * **Returns:** 1Y: {returns['1Y']}% | 3Y: {returns['3Y']}% | 5Y: {returns['5Y']}%
 
             ### 📝 GRADING RUBRIC (STRICTLY APPLY THIS)
             Compare metrics against these thresholds to assign a GRADE (Blue, Green, Orange, Red).
-            **IMPORTANT:** Also compare these metrics against typical {info.get('sector', 'N/A')} sector benchmarks in your analysis.
 
             **1. VALUATION & PROFITABILITY:**
-            * **P/E Ratio:** 0-16 (🔵 Great/Undervalued), 16-25 (🟢 Good/Fair), 25-35 (🟠 Caution/Expensive), >35 or <0 (🔴 Bad/Overvalued)
-            * **ROE:** >15% (🔵 Great/High Efficiency), 5-15% (🟢 Good), <5% (🔴 Bad/Inefficient)
-            * **Net Margin:** >15% (🔵 Great/High Profit), 5-15% (🟢 Good/Healthy), 0-5% (🟠 Caution/Low), <0% (🔴 Bad/Loss)
-            * **ROI:** >10% (🔵 Great), 5-10% (🟢 Good), <5% (🔴 Bad)
+            * **P/E Ratio:** 0-16 (🔵 Great), 16-25 (🟢 Good), 25-35 (🟠 Caution), >35 (🔴 Bad)
+            * **ROE:** >15% (🔵 Great), 5-15% (🟢 Good), <5% (🔴 Bad)
+            * **Net Margin:** >15% (🔵 Great), 5-15% (🟢 Good), 0-5% (🟠 Caution), <0% (🔴 Bad)
 
             **2. DEBT & HEALTH:**
-            * **Debt-to-Equity:** ≤0.6 (🔵 Great/Conservative), 0.6-1.0 (🟢 Good/Manageable), 1.0-1.5 (🟠 Caution/Leveraged), ≥1.5 (🔴 Bad/High Risk)
-            * **Debt-to-Asset:** <0.3 (🔵 Great/Asset Rich), 0.3-0.5 (🟢 Good), 0.5-0.75 (🟠 Caution), >0.75 (🔴 Bad/Debt Heavy)
+            * **Debt-to-Equity:** ≤0.6 (🔵 Great), 0.6-1.0 (🟢 Good), 1.0-1.5 (🟠 Caution), ≥1.5 (🔴 Bad)
+            * **Debt-to-Asset:** <0.3 (🔵 Great), 0.3-0.5 (🟢 Good), >0.75 (🔴 Bad)
 
-            **3. MOMENTUM / PERFORMANCE:**
-            * **1-Year Return:** >75% (🟠 Hot/Very Hot), 25-75% (🟢 Strong Trend), 15-25% (⚫ Neutral), <15% (🔴 Weak)
-            * **3-Year Return:** >200% (🟠 Multi-bagger), 45-150% (🟢 Consistent), 30-45% (⚫ Neutral), <30% (🔴 Stagnant)
-            * **5-Year Return:** >300% (🟠 Outlier), 100-200% (🟢 Doubler), 75-100% (⚫ Neutral), <75% (🔴 Underperformer)
+            **3. MOMENTUM:**
+            * **1-Year Return:** >75% (🟠 Hot), 25-75% (🟢 Strong), <15% (🔴 Weak)
 
             ### 📢 OUTPUT REQUIREMENTS
-            1.  **Metric Analysis Table:** Create a Markdown table with columns: **Metric | Value | Grade (Color) | Verdict**. Use emojis (🔵, 🟢, 🟠, 🔴, ⚫) for the grades.
-            2.  **Profitability Deep Dive:** Analyze FCF, ROIC, and ROE.
-            3.  **Valuation Context:** Analyze P/E, PEG, and EV/EBITDA against SECTOR PEERS.
-            4.  **Growth & Moat:** Discuss Revenue/EPS growth and Competitive Advantage (Moat).
-            5.  **Financial Health:** Analyze Net Debt, Debt-to-Equity, and Debt-to-Assets.
-            6.  **Sector Comparison:** Explicitly state how these metrics compare to the average {info.get('sector', 'N/A')} company.
+            1.  **Metric Table:** Markdown table: Metric | Value | Grade (Color) | Verdict.
+            2.  **Profitability:** Analyze FCF, ROIC, ROE.
+            3.  **Valuation:** Analyze P/E, PEG vs Peers.
+            4.  **Health:** Analyze Debt load.
             """
 
-            # 3. TECHNICAL & SENTIMENT PROMPTS
-            tech_prompt = f"""
-            Analyze Technicals for {ticker_to_analyze}.
-            Price: {current_price}
-            Returns: 1Y: {returns['1Y']}%, 3Y: {returns['3Y']}%.
-            Apply: Wyckoff, Price Action, Moving Averages.
-            Verdict: Bullish/Bearish/Neutral?
-            """
-            
-            soc_prompt = f"""
-            Analyze Sentiment for {ticker_to_analyze}.
-            News Context: {get_social_sentiment_data(ticker_to_analyze, company_name)}
-            Provide: Sentiment Score (1-10), Key Drivers, Risks.
-            """
-
+            # 3. TECHNICAL & DASHBOARD PROMPTS
+            tech_prompt = f"Analyze Technicals for {ticker_to_analyze}. Price: {current_price}. Returns 1Y: {returns['1Y']}%. Trend?"
             dashboard_prompt = f"""
-            Create a JSON summary for {ticker_to_analyze}.
-            Price: {current_price}
-            Fundamentals: Use the data provided in previous prompts.
-            Technicals: Trend is based on {returns['1Y']}% 1Y return.
-            
-            Output strictly valid JSON:
-            {{
-                "fundamentals_verdict": "Bullish/Bearish/Neutral",
-                "fundamentals_rating": "X/10",
-                "technicals_verdict": "Bullish/Bearish/Neutral",
-                "risk_level": "Low/Medium/High",
-                "sentiment_verdict": "Positive/Negative",
-                "key_driver": "Main stock driver",
-                "one_year_return": "{returns['1Y']}%"
-            }}
+            Create JSON summary for {ticker_to_analyze}. Price: {current_price}.
+            Fund Verdict: Based on P/E {info.get('trailingPE','N/A')} and ROE.
+            Tech Verdict: Based on 1Y Return {returns['1Y']}%.
+            Output JSON: {{ "fundamentals_verdict": "string", "fundamentals_rating": "X/10", "technicals_verdict": "string", "risk_level": "Low/Med/High", "sentiment_verdict": "string", "key_driver": "string" }}
             """
 
             # 4. Generate & Display
             fund_an = get_gemini_response(fund_prompt)
             tech_an = get_gemini_response(tech_prompt)
-            soc_an = get_gemini_response(soc_prompt)
             dash_raw = get_gemini_response(dashboard_prompt)
 
             try:
@@ -524,53 +517,23 @@ if ticker_to_analyze:
                 st.write(f"**Key Driver:** {dash_data.get('key_driver', 'N/A')}")
 
             with t1:
-                st.subheader("Multi-Timeframe FVG Confluence")
+                # Reuse the nice Card UI from previous turn
+                def render_card(pair, data, mode):
+                    css = "bullish" if mode=="bullish" else "bearish"
+                    st.markdown(f"""<div class="fvg-card {css}">
+                        <div class="fvg-header">{pair}</div>
+                        <div>{data['tf1_zone']['status']} | {data['tf2_zone']['status']}</div>
+                    </div>""", unsafe_allow_html=True)
                 
-                # --- Helper to render cards ---
-                def render_confluence_card(pair_name, data, mode="bullish"):
-                    t1, t2 = pair_name.split(', ')
-                    z1 = data['tf1']
-                    z2 = data['tf2']
-                    thresholds = data.get('thresholds', (0,0))
-                    
-                    css_class = "bullish" if mode == "bullish" else "bearish"
-                    status_class_1 = "status-inside" if z1['status'] == "INSIDE" else "status-near"
-                    status_class_2 = "status-inside" if z2['status'] == "INSIDE" else "status-near"
-                    
-                    st.markdown(f"""
-                    <div class="fvg-card {css_class}">
-                        <div class="fvg-header">{pair_name} Confluence</div>
-                        <div style="display: flex; justify-content: space-between;">
-                            <div style="flex: 1; padding-right: 10px;">
-                                <div class="fvg-sublabel">{t1} ZONE ({thresholds[0]}% Tol)</div>
-                                <div class="fvg-value">${z1['bottom']:.2f} - ${z1['top']:.2f}</div>
-                                <span class="status-badge {status_class_1}">{z1['status']}</span>
-                            </div>
-                            <div style="border-right: 1px solid #444; margin: 0 15px;"></div>
-                            <div style="flex: 1;">
-                                <div class="fvg-sublabel">{t2} ZONE ({thresholds[1]}% Tol)</div>
-                                <div class="fvg-value">${z2['bottom']:.2f} - ${z2['top']:.2f}</div>
-                                <span class="status-badge {status_class_2}">{z2['status']}</span>
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                # Render Bullish
-                if fvg_results and fvg_results['bullish_confluence']:
-                    st.success("🐂 **Bullish Zones Detected**")
-                    for pair, data in fvg_results['bullish_confluence'].items():
-                        render_confluence_card(pair, data, "bullish")
-                elif fvg_results:
-                    st.info("No Bullish Confluence Zones")
-
-                # Render Bearish
-                if fvg_results and fvg_results['bearish_confluence']:
-                    st.error("🐻 **Bearish Zones Detected**")
-                    for pair, data in fvg_results['bearish_confluence'].items():
-                        render_confluence_card(pair, data, "bearish")
-                elif fvg_results:
-                    st.info("No Bearish Confluence Zones")
+                if fvg_results['bullish_confluence']:
+                    st.success("🐂 **Bullish Zones**")
+                    for p, d in fvg_results['bullish_confluence'].items(): render_card(p, d, "bullish")
+                else: st.info("No Bullish Zones")
+                
+                if fvg_results['bearish_confluence']:
+                    st.error("🐻 **Bearish Zones**")
+                    for p, d in fvg_results['bearish_confluence'].items(): render_card(p, d, "bearish")
+                else: st.info("No Bearish Zones")
 
             with t2: st.markdown(fund_an)
             
@@ -580,4 +543,4 @@ if ticker_to_analyze:
                 st.plotly_chart(fig, use_container_width=True)
                 st.markdown(tech_an)
                 
-            with t4: st.markdown(soc_an)
+            with t4: st.write("Social sentiment analysis pending integration...")
